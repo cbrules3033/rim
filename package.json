@@ -1,0 +1,11 @@
+{
+  "name": "rim",
+  "version": "0.1.0",
+  "description": "RIM - procedurally generated hex planet (isometric, stylized)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  }
+}

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0f1115" />
+  <title>RIM — Planet Generator</title>
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='45' fill='%232e7ba6'/><circle cx='38' cy='42' r='18' fill='%238fb45a'/><circle cx='68' cy='62' r='12' fill='%23c2af58'/></svg>" />
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/vendor/three.module.js",
+      "three/addons/": "/vendor/addons/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <header>
+    <h1>RIM</h1>
+    <div class="controls">
+      <input id="seed" type="text" placeholder="seed" spellcheck="false" autocomplete="off" />
+      <button id="gen">Generate</button>
+      <button id="rand" title="Random seed">🎲</button>
+    </div>
+    <div id="stats"></div>
+  </header>
+
+  <main>
+    <canvas id="map"></canvas>
+    <aside id="panel" class="hidden"></aside>
+    <div id="hint">drag to spin · scroll to zoom · click a tile for details</div>
+  </main>
+
+  <div id="overlay" class="hidden"><div class="spinner"></div><span>Forging planet…</span></div>
+
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>
