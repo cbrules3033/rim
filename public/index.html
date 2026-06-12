@@ -24,13 +24,16 @@
       <button id="gen">Generate</button>
       <button id="rand" title="Random seed">🎲</button>
     </div>
+    <button id="back" title="Back to globe">← Globe</button>
+    <span id="loc"></span>
     <div id="stats"></div>
   </header>
 
   <main>
     <canvas id="map"></canvas>
+    <canvas id="localmap"></canvas>
     <aside id="panel" class="hidden"></aside>
-    <div id="hint">drag to spin · scroll to zoom · click a tile for details</div>
+    <div id="hint">drag to spin · scroll to zoom · click a tile · double-click to explore</div>
   </main>
 
   <div id="overlay" class="hidden"><div class="spinner"></div><span>Forging planet…</span></div>

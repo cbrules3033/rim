@@ -3,6 +3,7 @@
 
 import { buildGoldberg } from './public/js/sphere.js';
 import { generateWorld } from './public/js/worldgen.js';
+import { generateLocalMap } from './public/js/localmap.js';
 
 let failures = 0;
 function check(name, cond) {
@@ -62,6 +63,41 @@ check('different seed gives a different world', w3.tiles.some((t, i) => t.elev !
 
 check('fertility in range', w.tiles.every((t) => t.fertility >= 0 && t.fertility <= 100));
 check('most tiles have resources', w.tiles.filter((t) => t.resources.length).length / w.tiles.length > 0.85);
+
+// ---- local tile maps ----
+const riverTile = w.tiles.find((t) => t.riverN.length >= 1 && !t.water);
+const lm = generateLocalMap(w, riverTile);
+
+check('local map has cells', lm.cells.length > 1000);
+check('local map deterministic', (() => {
+  const lm2 = generateLocalMap(w, riverTile);
+  return lm.cells.every((c, i) =>
+    c.biome === lm2.cells[i].biome &&
+    c.elev === lm2.cells[i].elev &&
+    c.resource === lm2.cells[i].resource);
+})());
+check('local map has a river path', lm.rivers.length > 0 && lm.rivers[0].length > 2);
+check('river crossings sit on shared edge midpoints', lm.crossings.every((cr, i) => {
+  const mid = riverTile.edgeMid[riverTile.riverN[i]];
+  return Math.hypot(cr.p3[0] - mid[0], cr.p3[1] - mid[1], cr.p3[2] - mid[2]) < 1e-12;
+}));
+check('river path starts near its entry crossing', (() => {
+  const entry = lm.rivers[0][0];
+  const cr = lm.crossings[0];
+  return Math.hypot(entry.x - cr.x, entry.y - cr.y) < 25; // within ~1.5 cells
+})());
+check('all tile resources placed as deposits', riverTile.resources.every((id) =>
+  lm.cells.some((c) => c.resource === id)));
+
+const coastTile = w.tiles.find((t) => !t.water &&
+  t.neighbors.some((nid) => w.tiles[nid].water && w.tiles[nid].biome !== 'lake'));
+const clm = generateLocalMap(w, coastTile);
+check('coastal tile map contains ocean cells', clm.cells.some((c) => c.water));
+check('coastal tile map contains land cells', clm.cells.some((c) => !c.water));
+
+const oceanTile = w.tiles.find((t) => t.biome === 'deep_ocean');
+const olm = generateLocalMap(w, oceanTile);
+check('deep ocean tile map is mostly water', olm.cells.filter((c) => c.water).length / olm.cells.length > 0.8);
 
 console.log(failures ? `\n${failures} test(s) FAILED` : '\nAll tests passed');
 process.exit(failures ? 1 : 0);

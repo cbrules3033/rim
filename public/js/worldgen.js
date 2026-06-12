@@ -13,6 +13,22 @@ import {
 
 const WATER_FRACTION = 0.60;
 
+// Land biome from elevation-above-sea (0..1), temperature (°C), moisture (0..1).
+// Shared with the local tile-map generator so both levels of detail agree.
+export function classifyBiome(a, T, m) {
+  if (a > 0.82) return 'peak';
+  if (a > 0.62) return 'mountain';
+  if (T < -12) return m > 0.5 ? 'glacier' : 'snow';
+  if (T < -2) return m > 0.5 ? 'taiga' : 'tundra';
+  if (T < 6) return m < 0.25 ? 'steppe' : m < 0.55 ? 'grassland' : 'taiga';
+  if (T < 16) {
+    if (a < 0.1 && m > 0.8) return 'swamp';
+    return m < 0.2 ? 'steppe' : m < 0.45 ? 'plains' : m < 0.7 ? 'forest' : 'seasonal_forest';
+  }
+  if (a < 0.1 && m > 0.78) return 'marsh';
+  return m < 0.22 ? 'desert' : m < 0.45 ? 'savanna' : m < 0.65 ? 'seasonal_forest' : 'jungle';
+}
+
 function pickWeighted(rng, entries) {
   let total = 0;
   for (const [, w] of entries) total += w;
@@ -164,19 +180,7 @@ export function generateWorld(seed, freq = 24) {
       if (t.temp < -6) t.features.push('sea_ice');
       continue;
     }
-    const a = t.elevAbove, T = t.temp, m = t.moist;
-    if (a > 0.82) t.biome = 'peak';
-    else if (a > 0.62) t.biome = 'mountain';
-    else if (T < -12) t.biome = m > 0.5 ? 'glacier' : 'snow';
-    else if (T < -2) t.biome = m > 0.5 ? 'taiga' : 'tundra';
-    else if (T < 6) t.biome = m < 0.25 ? 'steppe' : m < 0.55 ? 'grassland' : 'taiga';
-    else if (T < 16) {
-      if (a < 0.1 && m > 0.8) t.biome = 'swamp';
-      else t.biome = m < 0.2 ? 'steppe' : m < 0.45 ? 'plains' : m < 0.7 ? 'forest' : 'seasonal_forest';
-    } else {
-      if (a < 0.1 && m > 0.78) t.biome = 'marsh';
-      else t.biome = m < 0.22 ? 'desert' : m < 0.45 ? 'savanna' : m < 0.65 ? 'seasonal_forest' : 'jungle';
-    }
+    t.biome = classifyBiome(t.elevAbove, t.temp, t.moist);
   }
 
   // ---- features ----

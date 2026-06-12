@@ -57,7 +57,51 @@ export function showTile(t) {
     ${features ? `<div class="section">Features</div><div class="chips">${features}</div>` : ''}
     <div class="section">Resources</div>
     ${resources}
+    <button id="explore" class="explore-btn">Explore this tile →</button>
     <div class="tile-seed dim">tile seed ${t.seed.toString(16)}</div>
+  `;
+  document.getElementById('panel-close').onclick = () => {
+    panel.classList.add('hidden');
+    panel.dispatchEvent(new CustomEvent('deselect', { bubbles: true }));
+  };
+  document.getElementById('explore').onclick = () => {
+    panel.dispatchEvent(new CustomEvent('explore', { bubbles: true, detail: t.id }));
+  };
+}
+
+// Info panel for a single cell of a local tile map.
+export function showCell(c) {
+  const panel = document.getElementById('panel');
+  if (!c) {
+    panel.classList.add('hidden');
+    return;
+  }
+  panel.classList.remove('hidden');
+  const B = BIOMES[c.biome];
+  const rows = [
+    ['Cell', `${c.q}, ${c.r}`],
+    ['Elevation', `${c.elevM} m`],
+    ['Temperature', `${c.temp}°C`],
+    ['Moisture', `${Math.round(c.moist * 100)}%`],
+    ['Fertility', `${c.fertility}/100`],
+  ];
+  const featLabels = { ...FEATURE_LABELS, tree: '🌳 Trees', cactus: '🌵 Cacti', rocks: '🪨 Boulders' };
+  const features = [...(c.river ? ['river'] : []), ...c.features]
+    .map((f) => `<span class="chip">${featLabels[f] || f}</span>`)
+    .join('');
+  const res = c.resource
+    ? `<div class="res"><span class="res-icon">${RESOURCES[c.resource].i}</span><span>${RESOURCES[c.resource].n}</span><span class="res-cat">${RESOURCES[c.resource].c}</span></div>`
+    : '<div class="dim">None</div>';
+  panel.innerHTML = `
+    <div class="panel-head">
+      <span class="swatch" style="background:${c.color}"></span>
+      <h2>${B.name}</h2>
+      <button id="panel-close" title="Close">✕</button>
+    </div>
+    ${rows.map(([k, v]) => `<div class="kv"><span>${k}</span><span>${v}</span></div>`).join('')}
+    ${features ? `<div class="section">Features</div><div class="chips">${features}</div>` : ''}
+    <div class="section">Resource Deposit</div>
+    ${res}
   `;
   document.getElementById('panel-close').onclick = () => {
     panel.classList.add('hidden');

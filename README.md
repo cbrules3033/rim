@@ -48,10 +48,12 @@ public/
   js/
     sphere.js              Goldberg polyhedron geometry (the hex sphere)
     worldgen.js             ★ planet generation pipeline
+    localmap.js             ★ expands one tile into a playable-scale hex map
     defs.js                 ★ biome/resource tables, colors, labels
     globe.js               Three.js renderer (tiles, rivers, picking, controls)
-    ui.js                  tile info panel + stats bar
-    main.js                bootstrapping, seed controls, pointer events
+    mapview.js             isometric canvas renderer for local tile maps
+    ui.js                  tile/cell info panels + stats bar
+    main.js                bootstrapping, view switching, pointer events
     rng.js                 seeded hash/PRNG (mulberry32), per-tile seeds
     noise.js               seedable 3D simplex noise
   vendor/                  three.js + OrbitControls (committed on purpose)
@@ -115,6 +117,27 @@ shading with a camera-attached light. Rivers are thin ribbon quads from tile
 center to edge midpoint — both tiles draw their half, so rivers connect
 seamlessly. Picking is a raycast with a `faceIndex → tile` lookup table.
 
+### Local tile maps (`localmap.js`, `mapview.js`)
+
+Double-click a tile on the globe (or hit **Explore this tile** in its panel) to
+open it as a ~2,500-cell isometric hex map. Generation is deterministic from
+`tileSeed` + world seed, and cached in memory, so revisiting a tile always
+shows the same map. How it stays consistent with the globe and with neighbors:
+
+- Cell attributes are **IDW-interpolated from the tile + its globe neighbors**,
+  then detailed with noise fields seeded by the *world* seed — those fields are
+  continuous across the whole sphere, so terrain flows smoothly toward what the
+  adjacent tile's map will contain (coastal tiles get real shorelines on the
+  ocean side, snowy neighbors bleed frost over the shared edge, etc.).
+- **Rivers enter/exit exactly at the globe's shared edge midpoints**
+  (`tile.edgeMid`), then meander deterministically through the cells toward the
+  opposite crossing, the sea, or a basin.
+- Tile features materialize: volcanoes raise a cone with a crater, oases dig a
+  pond ringed with palms, reefs patch the shallows, forests scatter trees by
+  biome density.
+- Every resource on the tile is placed as 2–4 concrete deposits in suitable
+  cells (fish in water, ores on high ground, crops on fertile flats).
+
 ## Conventions
 
 - Vanilla ES modules only — no bundler, no framework, no build step. Keep it
@@ -138,7 +161,7 @@ Public traffic reaches it through a Cloudflare Tunnel
 
 ## Roadmap
 
-- [ ] Load a tile as a playable local map (using `tileSeed`, matching edges)
+- [x] Load a tile as a detailed local map (using `tileSeed`, matching edges)
 - [ ] Travel between adjacent tile maps
 - [ ] More cross-border features (roads, mountain ranges as edge data)
 - [ ] Region/continent naming
