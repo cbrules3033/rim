@@ -45,9 +45,9 @@ function enterTile(tile) {
   let region = mapCache.get(tile.id);
   if (!region) {
     region = createRegion(world, tile);
-    region.getChunk(tile.id);
     mapCache.set(tile.id, region);
   }
+  region.discovered.add(tile.id); // world-level: stays discovered everywhere
   mapView.setMap(region);
   mode = 'map';
   document.body.classList.add('map-mode');

@@ -131,13 +131,22 @@ Neighbors start hidden under fog-of-war walls — nothing is generated or
 rendered for them. Send a villager into the fog and the moment they cross the
 tile boundary the neighbor chunk generates, the fog lifts, and the map expands.
 
+Generation is **canonical**: every chunk is generated exactly once, in its
+tile's own canonical tangent frame, from world seed + tile seed — then merely
+re-projected into whatever region you're viewing. A tile discovered from a
+neighbor is the *same tile* you get by entering it from the globe (tested).
+Discoveries, settlements, and villagers are stored world-level with positions
+on the sphere, so they follow you between views.
+
 Adjacent chunks line up **exactly**, by construction rather than by stitching:
 
-- All chunks share one global terrain-vertex grid and one hex-cell lattice in
-  the region frame; cells/quads are assigned to chunks by spherical Voronoi
-  ownership (which *is* the Goldberg tile polygon), so ownership is exclusive
-  and boundary vertices are computed from the same continuous field at the
-  same coordinates — bit-identical from both sides (tested in `test.js`).
+- The terrain field is a pure function of position on the sphere: smooth
+  distance-cutoff IDW over nearby tiles plus planet-wide detail noise — no
+  anchor-dependent inputs, so any two views of the same spot agree.
+- Within a region, all chunks share one terrain-vertex grid; cells/quads are
+  assigned to chunks by spherical Voronoi ownership (which *is* the Goldberg
+  tile polygon), so ownership is exclusive and boundary vertices are computed
+  from the same field at the same coordinates (tested in `test.js`).
 - Rivers end/start at the exact projected globe edge midpoints, so a river
   flows from one chunk into the next without a visible joint.
 

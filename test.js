@@ -70,26 +70,18 @@ const riverTile = w.tiles.find((t) =>
   t.riverN.length >= 1 && !t.water &&
   t.riverN.some((d) => !w.tiles[t.neighbors[d]].water));
 const region = createRegion(w, riverTile);
-const chunk = region.getChunk(riverTile.id);
+const chunk = region.localChunk(riverTile.id);
 
 check('anchor chunk has cells', chunk.cells.length > 1000);
-check('chunk deterministic', (() => {
-  const r2 = createRegion(w, riverTile);
-  const c2 = r2.getChunk(riverTile.id);
-  return chunk.cells.length === c2.cells.length && chunk.cells.every((c, i) =>
-    c.biome === c2.cells[i].biome &&
-    c.elev === c2.cells[i].elev &&
-    c.resource === c2.cells[i].resource);
-})());
 check('chunk has a river path', chunk.rivers.length > 0 && chunk.rivers[0].length > 2);
 check('all tile resources placed as deposits', riverTile.resources.every((id) =>
   chunk.cells.some((c) => c.resource === id)));
 
 // cross-chunk alignment: the river leaves this chunk at exactly the same
-// point where it enters the neighbor's chunk (shared frame, shared edgeMid)
+// point where it enters the neighbor's chunk (same edgeMid, same projection)
 const dirToLand = riverTile.riverN.find((d) => !w.tiles[riverTile.neighbors[d]].water);
 const neighborTile = w.tiles[riverTile.neighbors[dirToLand]];
-const nChunk = region.getChunk(neighborTile.id);
+const nChunk = region.localChunk(neighborTile.id);
 const myCrossing = chunk.crossings.find((c) => c.dir === dirToLand);
 const theirDir = neighborTile.neighbors.indexOf(riverTile.id);
 const theirCrossing = nChunk.crossings.find((c) => c.dir === theirDir);
@@ -103,32 +95,50 @@ check('both chunks have a river endpoint at the shared crossing', (() => {
     nChunk.rivers.some((pts) => at(pts, theirCrossing));
 })());
 
-// adjacent chunks never claim the same cell, and ownership is exclusive
-check('no cell claimed by two chunks', (() => {
-  const seen = new Set();
-  for (const c of [...chunk.cells, ...nChunk.cells]) {
-    const k = c.q + ',' + c.r;
-    if (seen.has(k)) return false;
-    seen.add(k);
-  }
-  return true;
+// ---- CANONICAL generation: a tile is the same tile from every region ----
+// This is the "discover B from A, then enter B from the globe" scenario.
+// Use a fresh world object (same seed) so nothing comes from a shared cache.
+const wDup = generateWorld(SEED);
+const tB = wDup.tiles[neighborTile.id];
+const viaA = region.localChunk(neighborTile.id);             // discovered from A
+const viaB = createRegion(wDup, tB).localChunk(tB.id);       // entered directly
+check('chunk content is canonical across anchors (cells match)',
+  viaA.cells.length === viaB.cells.length &&
+  viaA.cells.every((c, i) =>
+    c.q === viaB.cells[i].q && c.r === viaB.cells[i].r &&
+    c.biome === viaB.cells[i].biome &&
+    c.resource === viaB.cells[i].resource &&
+    c.river === viaB.cells[i].river &&
+    JSON.stringify(c.features) === JSON.stringify(viaB.cells[i].features)));
+check('canonical river paths match across anchors',
+  viaA.rivers.length === viaB.rivers.length &&
+  viaA.rivers.every((pts, i) => pts.length === viaB.rivers[i].length));
+check('canonical field matches across anchors at a shared point', (() => {
+  // evaluate the field at the same sphere point through both region frames
+  const p3 = neighborTile.center;
+  const rA = createRegion(w, riverTile);
+  const [ax, ay] = rA.project(p3);
+  const rB = createRegion(wDup, tB);
+  const [bx, by] = rB.project(p3);
+  const sa = rA.sample(ax, ay), sb = rB.sample(bx, by);
+  return Math.abs(sa.e - sb.e) < 1e-9 && sa.biome === sb.biome;
 })());
-check('terrain field is identical across the boundary', (() => {
-  // sample the exact crossing point twice via both chunk paths — same region
-  // field, must be bit-identical
-  const a = region.sample(myCrossing.x, myCrossing.y);
-  const b = region.sample(theirCrossing.x, theirCrossing.y);
-  return a.e === b.e && a.biome === b.biome;
+
+// adjacent chunks never claim the same spot (Voronoi ownership is exclusive)
+check('cell ownership is exclusive', (() => {
+  for (const c of chunk.cells) if (c.tid !== riverTile.id) return false;
+  for (const c of nChunk.cells) if (c.tid !== neighborTile.id) return false;
+  return true;
 })());
 
 const coastTile = w.tiles.find((t) => !t.water &&
   t.neighbors.some((nid) => w.tiles[nid].water && w.tiles[nid].biome !== 'lake'));
-const clm = createRegion(w, coastTile).getChunk(coastTile.id);
+const clm = createRegion(w, coastTile).localChunk(coastTile.id);
 check('coastal chunk contains ocean cells', clm.cells.some((c) => c.water));
 check('coastal chunk contains land cells', clm.cells.some((c) => !c.water));
 
 const oceanTile = w.tiles.find((t) => t.biome === 'deep_ocean');
-const olm = createRegion(w, oceanTile).getChunk(oceanTile.id);
+const olm = createRegion(w, oceanTile).localChunk(oceanTile.id);
 check('deep ocean chunk is mostly water', olm.cells.filter((c) => c.water).length / olm.cells.length > 0.8);
 
 console.log(failures ? `\n${failures} test(s) FAILED` : '\nAll tests passed');

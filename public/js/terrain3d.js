@@ -153,8 +153,7 @@ export class TerrainView {
     return -Math.min(1, (sea - e) / sea) * DSCALE;
   }
 
-  chunkHeightAt(chunk, x, z) {
-    const td = chunk.terrainData;
+  chunkHeightAt(td, x, z) {
     const fx = x / STEP - td.ixMin, fz = z / STEP - td.izMin;
     const ix = Math.max(0, Math.min(td.nx - 2, Math.floor(fx)));
     const iz = Math.max(0, Math.min(td.nz - 2, Math.floor(fz)));
@@ -167,8 +166,8 @@ export class TerrainView {
 
   meshHeightAt(x, z) {
     const owner = this.region.tileOf(x, z);
-    const chunk = this.region.chunks.get(owner.id);
-    if (chunk?.terrainData) return this.chunkHeightAt(chunk, x, z);
+    const td = this.region.terrainData.get(owner.id);
+    if (td) return this.chunkHeightAt(td, x, z);
     return this.baseHeight(this.region.sample(x, z).e);
   }
 
@@ -204,12 +203,23 @@ export class TerrainView {
     this.group = new THREE.Group();
     this.scene.add(this.group);
 
-    for (const id of region.discovered) this.buildChunkView(id);
     for (const t of region.tiles) {
-      if (!region.discovered.has(t.id)) this.addFogSlab(t.id);
+      if (region.discovered.has(t.id)) this.buildChunkView(t.id);
+      else this.addFogSlab(t.id);
     }
-    for (const s of region.settlements) this.addSettlementMeshes(s);
-    for (const c of region.civs) this.addCivMesh(c);
+    // world-level settlements/civs: render the ones inside this region,
+    // positioned by re-projecting their canonical sphere positions
+    for (const s of region.settlements) {
+      if (!region.polys.has(s.tid)) continue;
+      [s.x, s.z] = region.project(s.p3);
+      this.addSettlementMeshes(s);
+    }
+    for (const c of region.civs) {
+      if (!region.polys.has(c.tid)) continue;
+      [c.x, c.z] = region.project(c.p3);
+      c.target = null;
+      this.addCivMesh(c);
+    }
 
     this.camera.position.set(0, 380, 500);
     this.controls.target.set(0, 0, 0);
@@ -262,15 +272,19 @@ export class TerrainView {
 
   buildChunkView(tileId) {
     const region = this.region;
-    const chunk = region.getChunk(tileId);
-    if (!chunk.terrainData) this.buildTerrainData(chunk);
+    const chunk = region.localChunk(tileId);
+    let td = region.terrainData.get(tileId);
+    if (!td) {
+      td = this.buildTerrainData(chunk);
+      region.terrainData.set(tileId, td);
+    }
     const g = new THREE.Group();
 
     // terrain
     let geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(chunk.terrainData.pos, 3));
-    geo.setAttribute('color', new THREE.BufferAttribute(chunk.terrainData.col, 3));
-    geo.setIndex(chunk.terrainData.idx);
+    geo.setAttribute('position', new THREE.BufferAttribute(td.pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(td.col, 3));
+    geo.setIndex(td.idx);
     geo = geo.toNonIndexed();
     geo.computeVertexNormals();
     const terrain = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
@@ -295,8 +309,8 @@ export class TerrainView {
     water.renderOrder = 1;
     g.add(water);
 
-    this.buildChunkRivers(chunk, g);
-    this.buildChunkProps(chunk, g);
+    this.buildChunkRivers(chunk, td, g);
+    this.buildChunkProps(chunk, td, g);
 
     this.group.add(g);
     this.chunkViews.set(tileId, g);
@@ -316,7 +330,7 @@ export class TerrainView {
     };
     addSegs(chunk);
     for (const nid of chunk.tile.neighbors) {
-      if (region.polys.has(nid)) addSegs(region.getChunk(nid));
+      if (region.polys.has(nid)) addSegs(region.localChunk(nid));
     }
     const riverW = 3 + Math.min(chunk.flow, 10) * 0.35;
     const depress = (x, z) => {
@@ -369,10 +383,10 @@ export class TerrainView {
       }
     }
 
-    chunk.terrainData = { ixMin, izMin, nx, nz, pos, col, idx, hGrid };
+    return { ixMin, izMin, nx, nz, pos, col, idx, hGrid };
   }
 
-  buildChunkRivers(chunk, g) {
+  buildChunkRivers(chunk, td, g) {
     if (!chunk.rivers.length) return;
     const verts = [];
     const up = new THREE.Vector3(0, 1, 0);
@@ -389,7 +403,7 @@ export class TerrainView {
         const p = curve.getPoint(t);
         const tan = curve.getTangent(t);
         const side = new THREE.Vector3().crossVectors(tan, up).setY(0).normalize().multiplyScalar(w);
-        const y = Math.max(this.chunkHeightAt(chunk, p.x, p.z) + 0.45, WATER_Y - 0.1);
+        const y = Math.max(this.chunkHeightAt(td, p.x, p.z) + 0.45, WATER_Y - 0.1);
         const L = [p.x + side.x, y, p.z + side.z];
         const R = [p.x - side.x, y, p.z - side.z];
         if (prev) verts.push(...prev.L, ...prev.R, ...L, ...L, ...prev.R, ...R);
@@ -410,7 +424,7 @@ export class TerrainView {
 
   // ---------- props ----------
 
-  buildChunkProps(chunk, g) {
+  buildChunkProps(chunk, td, g) {
     const region = this.region;
     const rng = mulberry32(chunk.tile.seed ^ 0x51ab73c1);
     const trunks = [], cones = [], leafs = [], palms = [], cacti = [], rocks = [];
@@ -419,7 +433,7 @@ export class TerrainView {
 
     const groundOk = (x, z) => {
       if (region.tileOf(x, z).id !== chunk.tileId) return -999; // stay in chunk
-      return this.chunkHeightAt(chunk, x, z);
+      return this.chunkHeightAt(td, x, z);
     };
 
     for (const c of chunk.cells) {
@@ -456,7 +470,7 @@ export class TerrainView {
         const n = 2 + Math.floor(rng() * 3);
         for (let i = 0; i < n; i++) {
           const x = c.x + (rng() - 0.5) * HEXW, z = c.y + (rng() - 0.5) * HEXW;
-          const h = this.chunkHeightAt(chunk, x, z);
+          const h = this.chunkHeightAt(td, x, z);
           if (h < WATER_Y - 0.8) corals.push({ x, z, h, s: 0.6 + rng(), t: rng() });
         }
       }
@@ -560,7 +574,7 @@ export class TerrainView {
       c.setHex(it.color);
     });
     addInstanced(new THREE.BoxGeometry(9, 0.8, 2), stdMat(), cropRows(crops), (it, d, c) => {
-      d.position.set(it.x, this.chunkHeightAt(chunk, it.x, it.z) + 0.5, it.z);
+      d.position.set(it.x, this.chunkHeightAt(td, it.x, it.z) + 0.5, it.z);
       d.rotation.set(0, it.rot, 0);
       c.setHex(it.color);
     });
@@ -732,6 +746,7 @@ export class TerrainView {
       if (hh < 0.8 || Math.abs(hh - h) > 6) return false;
     }
     for (const s of this.region.settlements) {
+      if (!this.region.polys.has(s.tid)) continue;
       if (Math.hypot(s.x - x, s.z - z) < 55) return false;
     }
     return true;
@@ -800,9 +815,7 @@ export class TerrainView {
   }
 
   cellAtPoint(x, z) {
-    const r = Math.round(z / ROWH);
-    const q = Math.round(x / HEXW - r / 2);
-    const cell = this.region.cells.get(q + ',' + r);
+    const cell = this.region.cellAt(x, z);
     return cell && this.region.discovered.has(cell.tid) ? cell : null;
   }
 
@@ -821,15 +834,21 @@ export class TerrainView {
     for (let i = 0; i < sylCount; i++) name += SYL[Math.floor(rng() * SYL.length)];
     name = name[0].toUpperCase() + name.slice(1);
 
-    const s = { x, z, name, founded: Date.now() };
+    const p3 = this.region.to3D(x, z);
+    const s = {
+      x, z, p3, name, founded: Date.now(),
+      tid: this.region.tileOf(x, z).id,
+    };
     this.region.settlements.push(s);
     this.addSettlementMeshes(s);
 
     const CLOTHES = [0x4a7ab5, 0xb55a4a, 0x5ab55a, 0xb5a04a, 0x8a5ab5, 0x4ab5a8];
     for (let i = 0; i < 5; i++) {
       const a = (i / 5) * Math.PI * 2 + rng();
+      const cx = x + Math.cos(a) * 22, cz = z + Math.sin(a) * 22;
       const civ = {
-        x: x + Math.cos(a) * 22, z: z + Math.sin(a) * 22,
+        x: cx, z: cz, p3: this.region.to3D(cx, cz),
+        tid: this.region.tileOf(cx, cz).id,
         color: CLOTHES[Math.floor(rng() * CLOTHES.length)],
         home: name, target: null, speed: 9, phase: rng() * 6.28,
       };
@@ -906,7 +925,7 @@ export class TerrainView {
   updateCivs(dt, t) {
     for (const civ of this.region.civs) {
       const g = civ.mesh;
-      if (!g) continue;
+      if (!g || !g.parent) continue;
       let bob = 0;
       if (civ.target) {
         const dx = civ.target[0] - civ.x, dz = civ.target[1] - civ.z;
@@ -931,6 +950,8 @@ export class TerrainView {
           } else {
             civ.x = nx;
             civ.z = nz;
+            civ.p3 = this.region.to3D(nx, nz);   // canonical position
+            if (owner) civ.tid = owner.id;
             g.rotation.y = -Math.atan2(dz, dx) + Math.PI / 2;
             bob = Math.abs(Math.sin(t * 11 + civ.phase)) * 0.5;
           }
