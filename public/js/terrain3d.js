@@ -1,6 +1,7 @@
-// 3D landscape renderer for local tile maps: smooth low-poly terrain, real
-// water, carved meandering rivers, dense instanced forests, rock piles, ore
-// crystals, crop fields, and animals that wander around.
+// 3D landscape renderer for regions: chunked terrain (one chunk per globe
+// tile) on a single shared grid so adjacent chunks meet seam-free, fog of war
+// over undiscovered neighbors, settlements, and controllable villagers who
+// can walk into the fog to discover new chunks.
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -11,7 +12,8 @@ import { CELL, HEXW, ROWH, sampleColor } from './localmap.js';
 const HSCALE = 62;      // land elevation scale (map units)
 const DSCALE = 20;      // seabed depth scale
 const WATER_Y = -0.55;
-const GRID_RES = 168;   // terrain vertices per side
+const STEP = 5.5;       // global terrain vertex grid step — shared by all chunks
+const FOG_TOP = 58, FOG_BOT = -45;
 
 const ANIMALS = {
   deer:   { c: 0x9a6a3a, s: 1.0, n: 5 },
@@ -34,7 +36,7 @@ const CRYSTALS = {
   nickel: 0xc0bca8, bauxite: 0xc77b5a, platinum: 0xe8eef5, uranium: 0x8aef3a,
   saltpeter: 0xe0dcc8, marble: 0xeae8e2, stone: 0x8d8d92, sand: 0xe3cf94,
   amber: 0xe09a2a, jade: 0x3fae6a, flint: 0x55504a, clay: 0xa9684a,
-  obsidian2: 0x111118, oil: 0x1c1c20, gas: 0x9fb8c8, geothermal: 0xe06a3a,
+  oil: 0x1c1c20, gas: 0x9fb8c8, geothermal: 0xe06a3a,
   peat: 0x4f3d2a, sugar: 0xf7f7f7, spices: 0xc23b1e, cocoa: 0x5c3a26,
   coffee: 0x3e2a1d, honey: 0xe8a82a, pearls: 0xf0e8e0, ice: 0xcfe6f2,
 };
@@ -49,9 +51,8 @@ const TIMBER = new Set(['timber', 'hardwood', 'mushrooms', 'truffles']);
 const FISHY = { fish: { c: 0x5a7a8a, s: 1 }, crabs: { c: 0xc05a3a, s: 0.6 }, whales: { c: 0x36506a, s: 3.2 }, kelp: { c: 0x3a7a4a, s: 1 } };
 
 export class TerrainView {
-  constructor(canvas, onPick) {
+  constructor(canvas) {
     this.canvas = canvas;
-    this.onPick = onPick;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
@@ -59,9 +60,9 @@ export class TerrainView {
 
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x05070c);
-    this.scene.fog = new THREE.Fog(0x05070c, 1000, 2400);
+    this.scene.fog = new THREE.Fog(0x05070c, 1400, 3200);
 
-    this.camera = new THREE.PerspectiveCamera(50, 1, 1, 5000);
+    this.camera = new THREE.PerspectiveCamera(50, 1, 1, 7000);
 
     this.scene.add(new THREE.HemisphereLight(0xbfd8ff, 0x46412e, 0.85));
     const sun = new THREE.DirectionalLight(0xfff2dd, 1.9);
@@ -69,9 +70,9 @@ export class TerrainView {
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
     const sc = sun.shadow.camera;
-    sc.left = -560; sc.right = 560; sc.top = 560; sc.bottom = -560;
-    sc.near = 50; sc.far = 1400;
-    sun.shadow.bias = -0.0006;
+    sc.left = -1200; sc.right = 1200; sc.top = 1200; sc.bottom = -1200;
+    sc.near = 50; sc.far = 1600;
+    sun.shadow.bias = -0.0008;
     this.scene.add(sun);
 
     this.controls = new OrbitControls(this.camera, canvas);
@@ -80,14 +81,28 @@ export class TerrainView {
     this.controls.screenSpacePanning = false;
     this.controls.maxPolarAngle = 1.5;
     this.controls.minDistance = 40;
-    this.controls.maxDistance = 1600;
+    this.controls.maxDistance = 2600;
 
     this.raycaster = new THREE.Raycaster();
     this.pointer = new THREE.Vector2();
     this.clock = new THREE.Clock();
     this.group = null;
-    this.map = null;
+    this.region = null;
     this.movers = [];
+    this.chunkViews = new Map(); // tileId -> Group
+    this.fogSlabs = new Map();   // tileId -> Mesh
+    this.terrains = [];          // raycast list of chunk terrain meshes
+
+    // callbacks
+    this.onInfo = null;
+    this.onSettlement = null;
+    this.onPlacement = null;
+    this.onDiscover = null;
+
+    this.placementMode = false;
+    this.selectedCiv = null;
+    this.civMeshes = [];
+    this.settlementMeshes = [];
 
     this.ring = new THREE.Mesh(
       new THREE.TorusGeometry(CELL * 0.85, 0.45, 8, 28),
@@ -96,15 +111,6 @@ export class TerrainView {
     this.ring.rotation.x = Math.PI / 2;
     this.ring.visible = false;
     this.scene.add(this.ring);
-
-    // ---- settlement / villager state ----
-    this.placementMode = false;
-    this.selectedCiv = null;
-    this.civMeshes = [];
-    this.settlementMeshes = [];
-    this.onInfo = null;        // (cell) => — clicked plain ground
-    this.onSettlement = null;  // (settlement) => — clicked a settlement
-    this.onPlacement = null;   // (active) => — placement mode toggled
 
     this.ghost = this.makeGhost();
     this.scene.add(this.ghost);
@@ -139,212 +145,254 @@ export class TerrainView {
     return g;
   }
 
-  // ---------- terrain field helpers ----------
+  // ---------- heights ----------
 
   baseHeight(e) {
-    const sea = this.map.sea;
+    const sea = this.region.sea;
     if (e >= sea) return Math.pow((e - sea) / (1 - sea), 1.05) * HSCALE;
     return -Math.min(1, (sea - e) / sea) * DSCALE;
   }
 
-  riverDepress(x, z) {
-    let d2 = Infinity;
-    for (const [ax, az, bx, bz] of this.riverSegs) {
-      const dx = bx - ax, dz = bz - az;
-      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz || 1)));
-      const px = ax + dx * t - x, pz = az + dz * t - z;
-      const dd = px * px + pz * pz;
-      if (dd < d2) d2 = dd;
-    }
-    const d = Math.sqrt(d2);
-    const R = this.riverW + 7;
-    if (d >= R) return 0;
-    return Math.pow(1 - d / R, 1.5) * 4.4;
-  }
-
-  // height of the *rendered* terrain surface (bilinear over the height grid) —
-  // use this for placing anything on the ground so nothing floats or sinks
-  meshHeightAt(x, z) {
-    const { hGrid, hExt, hStep } = this;
-    const fx = (x + hExt) / hStep, fz = (z + hExt) / hStep;
-    const ix = Math.max(0, Math.min(GRID_RES - 2, Math.floor(fx)));
-    const iz = Math.max(0, Math.min(GRID_RES - 2, Math.floor(fz)));
-    const tx = fx - ix, tz = fz - iz;
-    const h00 = hGrid[iz * GRID_RES + ix], h10 = hGrid[iz * GRID_RES + ix + 1];
-    const h01 = hGrid[(iz + 1) * GRID_RES + ix], h11 = hGrid[(iz + 1) * GRID_RES + ix + 1];
+  chunkHeightAt(chunk, x, z) {
+    const td = chunk.terrainData;
+    const fx = x / STEP - td.ixMin, fz = z / STEP - td.izMin;
+    const ix = Math.max(0, Math.min(td.nx - 2, Math.floor(fx)));
+    const iz = Math.max(0, Math.min(td.nz - 2, Math.floor(fz)));
+    const tx = Math.max(0, Math.min(1, fx - ix)), tz = Math.max(0, Math.min(1, fz - iz));
+    const g = td.hGrid;
+    const h00 = g[iz * td.nx + ix], h10 = g[iz * td.nx + ix + 1];
+    const h01 = g[(iz + 1) * td.nx + ix], h11 = g[(iz + 1) * td.nx + ix + 1];
     return (h00 * (1 - tx) + h10 * tx) * (1 - tz) + (h01 * (1 - tx) + h11 * tx) * tz;
   }
 
-  heightAt(x, z) {
-    let h = this.baseHeight(this.map.sample(x, z).e);
-    if (this.riverSegs.length && h > -2) h -= this.riverDepress(x, z);
-    return h;
+  meshHeightAt(x, z) {
+    const owner = this.region.tileOf(x, z);
+    const chunk = this.region.chunks.get(owner.id);
+    if (chunk?.terrainData) return this.chunkHeightAt(chunk, x, z);
+    return this.baseHeight(this.region.sample(x, z).e);
+  }
+
+  // is this point on an explorable region tile?
+  inRegion(x, z) {
+    const owner = this.region.tileOf(x, z);
+    return this.region.polys.has(owner.id) ? owner : null;
   }
 
   // ---------- scene building ----------
 
-  setMap(map) {
+  setMap(region) {
     if (this.group) {
       this.group.traverse((o) => {
         if (o.geometry) o.geometry.dispose();
-        if (o.material) o.material.dispose();
+        if (o.material && !o.isInstancedMesh) o.material.dispose?.();
       });
       this.scene.remove(this.group);
     }
-    this.map = map;
+    this.region = region;
     this.movers = [];
+    this.chunkViews.clear();
+    this.fogSlabs.clear();
+    this.terrains = [];
+    this.civMeshes = [];
+    this.settlementMeshes = [];
     this.ring.visible = false;
     this.civRing.visible = false;
     this.moveMarker.visible = false;
     this.ghost.visible = false;
     this.placementMode = false;
     this.selectedCiv = null;
-    this.civMeshes = [];
-    this.settlementMeshes = [];
-    map.settlements = map.settlements || []; // persists per tile (cached map)
-    map.civs = map.civs || [];
     this.group = new THREE.Group();
-
-    this.riverW = 3 + Math.min(map.tile.flow, 10) * 0.35;
-    this.riverSegs = [];
-    for (const path of map.rivers) {
-      for (let i = 0; i < path.length - 1; i++) {
-        this.riverSegs.push([path[i].x, path[i].y, path[i + 1].x, path[i + 1].y]);
-      }
-    }
-
-    this.buildTerrain();
-    this.buildWater();
-    this.buildRivers();
-    this.buildProps();
-    for (const s of this.map.settlements) this.addSettlementMeshes(s);
-    for (const c of this.map.civs) this.addCivMesh(c);
     this.scene.add(this.group);
+
+    for (const id of region.discovered) this.buildChunkView(id);
+    for (const t of region.tiles) {
+      if (!region.discovered.has(t.id)) this.addFogSlab(t.id);
+    }
+    for (const s of region.settlements) this.addSettlementMeshes(s);
+    for (const c of region.civs) this.addCivMesh(c);
 
     this.camera.position.set(0, 380, 500);
     this.controls.target.set(0, 0, 0);
     this.controls.update();
   }
 
-  distOutside(x, y) {
-    const poly = this.map.poly;
-    let inside = false, min = Infinity;
-    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-      const [xi, yi] = poly[i], [xj, yj] = poly[j];
-      if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
-      const dx = xj - xi, dy = yj - yi;
-      const t = Math.max(0, Math.min(1, ((x - xi) * dx + (y - yi) * dy) / (dx * dx + dy * dy)));
-      const px = xi + dx * t - x, py = yi + dy * t - y;
-      min = Math.min(min, px * px + py * py);
+  discoverTile(tileId) {
+    const region = this.region;
+    if (region.discovered.has(tileId) || !region.polys.has(tileId)) return false;
+    region.discovered.add(tileId);
+    const slab = this.fogSlabs.get(tileId);
+    if (slab) {
+      slab.geometry.dispose();
+      slab.material.dispose();
+      this.group.remove(slab);
+      this.fogSlabs.delete(tileId);
     }
-    return inside ? 0 : Math.sqrt(min);
+    this.buildChunkView(tileId);
+    this.onDiscover?.(region.world.tiles[tileId]);
+    return true;
   }
 
-  buildTerrain() {
-    const map = this.map;
-    const ext = Math.max(...map.poly.map(([x, y]) => Math.max(Math.abs(x), Math.abs(y)))) + 26;
-    const step = (2 * ext) / (GRID_RES - 1);
-    this.hExt = ext;
-    this.hStep = step;
-    this.hGrid = new Float32Array(GRID_RES * GRID_RES);
-    const N = GRID_RES;
-    const pos = new Float32Array(N * N * 3);
-    const col = new Float32Array(N * N * 3);
-    const out = new Float32Array(N * N);
+  addFogSlab(tileId) {
+    const poly = this.region.polys.get(tileId);
+    // expand slightly outward so seams with terrain are hidden
+    const cx = poly.reduce((a, p) => a + p[0], 0) / poly.length;
+    const cy = poly.reduce((a, p) => a + p[1], 0) / poly.length;
+    const pp = poly.map(([x, y]) => [cx + (x - cx) * 1.015, cy + (y - cy) * 1.015]);
+    const verts = [];
+    // top fan
+    for (let i = 1; i < pp.length - 1; i++) {
+      verts.push(pp[0][0], FOG_TOP, pp[0][1], pp[i][0], FOG_TOP, pp[i][1], pp[i + 1][0], FOG_TOP, pp[i + 1][1]);
+    }
+    // walls
+    for (let i = 0; i < pp.length; i++) {
+      const a = pp[i], b = pp[(i + 1) % pp.length];
+      verts.push(a[0], FOG_BOT, a[1], b[0], FOG_BOT, b[1], b[0], FOG_TOP, b[1]);
+      verts.push(a[0], FOG_BOT, a[1], b[0], FOG_TOP, b[1], a[0], FOG_TOP, a[1]);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+    geo.computeVertexNormals();
+    const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({
+      color: 0x10141d, transparent: true, opacity: 0.96, side: THREE.DoubleSide,
+    }));
+    mesh.userData.fogTile = tileId;
+    this.group.add(mesh);
+    this.fogSlabs.set(tileId, mesh);
+  }
+
+  buildChunkView(tileId) {
+    const region = this.region;
+    const chunk = region.getChunk(tileId);
+    if (!chunk.terrainData) this.buildTerrainData(chunk);
+    const g = new THREE.Group();
+
+    // terrain
+    let geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(chunk.terrainData.pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(chunk.terrainData.col, 3));
+    geo.setIndex(chunk.terrainData.idx);
+    geo = geo.toNonIndexed();
+    geo.computeVertexNormals();
+    const terrain = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+    terrain.receiveShadow = true;
+    terrain.userData.chunkTile = tileId;
+    g.add(terrain);
+    this.terrains.push(terrain);
+
+    // water (flat fan over the tile polygon)
+    const poly = chunk.poly;
+    const wverts = [];
+    for (let i = 1; i < poly.length - 1; i++) {
+      wverts.push(poly[0][0], WATER_Y, poly[0][1], poly[i][0], WATER_Y, poly[i][1], poly[i + 1][0], WATER_Y, poly[i + 1][1]);
+    }
+    const wgeo = new THREE.BufferGeometry();
+    wgeo.setAttribute('position', new THREE.Float32BufferAttribute(wverts, 3));
+    wgeo.computeVertexNormals();
+    const water = new THREE.Mesh(wgeo, new THREE.MeshPhongMaterial({
+      color: 0x2486b8, transparent: true, opacity: 0.72,
+      shininess: 90, specular: 0x6699bb, side: THREE.DoubleSide,
+    }));
+    water.renderOrder = 1;
+    g.add(water);
+
+    this.buildChunkRivers(chunk, g);
+    this.buildChunkProps(chunk, g);
+
+    this.group.add(g);
+    this.chunkViews.set(tileId, g);
+  }
+
+  buildTerrainData(chunk) {
+    const region = this.region;
+    // river segments from this chunk + adjacent region chunks, so heights at
+    // shared boundary vertices are identical no matter which chunk computes them
+    const segs = [];
+    const addSegs = (ch) => {
+      for (const pts of ch.rivers) {
+        for (let i = 0; i < pts.length - 1; i++) {
+          segs.push([pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y]);
+        }
+      }
+    };
+    addSegs(chunk);
+    for (const nid of chunk.tile.neighbors) {
+      if (region.polys.has(nid)) addSegs(region.getChunk(nid));
+    }
+    const riverW = 3 + Math.min(chunk.flow, 10) * 0.35;
+    const depress = (x, z) => {
+      let d2 = Infinity;
+      for (const [ax, az, bx, bz] of segs) {
+        const dx = bx - ax, dz = bz - az;
+        const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz || 1)));
+        const px = ax + dx * t - x, pz = az + dz * t - z;
+        const dd = px * px + pz * pz;
+        if (dd < d2) d2 = dd;
+      }
+      const d = Math.sqrt(d2);
+      const R = riverW + 7;
+      if (d >= R) return 0;
+      return Math.pow(1 - d / R, 1.5) * 4.4;
+    };
+
+    const xs = chunk.poly.map((p) => p[0]), ys = chunk.poly.map((p) => p[1]);
+    const ixMin = Math.floor((Math.min(...xs) - 10) / STEP), ixMax = Math.ceil((Math.max(...xs) + 10) / STEP);
+    const izMin = Math.floor((Math.min(...ys) - 10) / STEP), izMax = Math.ceil((Math.max(...ys) + 10) / STEP);
+    const nx = ixMax - ixMin + 1, nz = izMax - izMin + 1;
+    const pos = new Float32Array(nx * nz * 3);
+    const col = new Float32Array(nx * nz * 3);
+    const hGrid = new Float32Array(nx * nz);
     const lin = (c) => Math.pow(c / 255, 2.2);
 
-    for (let iz = 0; iz < N; iz++) {
-      for (let ix = 0; ix < N; ix++) {
-        const i = iz * N + ix;
-        const x = -ext + ix * step, z = -ext + iz * step;
-        const dOut = this.distOutside(x, z);
-        out[i] = dOut;
-        let h, rgb;
-        if (dOut > 40) {
-          h = -60;
-          rgb = [24, 22, 21];
-        } else {
-          const s = map.sample(x, z);
-          h = this.baseHeight(s.e);
-          if (this.riverSegs.length && h > -2) h -= this.riverDepress(x, z);
-          const jit = (Math.sin(x * 12.9898 + z * 78.233) * 43758.5453 % 1) * 0.08 - 0.04;
-          rgb = sampleColor(s, jit);
-          if (dOut > 0) {
-            const t = Math.min(1, dOut / 26);
-            h = h * (1 - t) - 62 * t * t;            // cliff edge of the diorama
-            rgb = [rgb[0] + (38 - rgb[0]) * t, rgb[1] + (34 - rgb[1]) * t, rgb[2] + (31 - rgb[2]) * t];
-          }
-        }
-        this.hGrid[i] = h;
+    for (let iz = 0; iz < nz; iz++) {
+      for (let ix = 0; ix < nx; ix++) {
+        const i = iz * nx + ix;
+        const x = (ixMin + ix) * STEP, z = (izMin + iz) * STEP;
+        const s = region.sample(x, z);
+        let h = this.baseHeight(s.e);
+        if (segs.length && h > -2) h -= depress(x, z);
+        const jit = (Math.sin(x * 12.9898 + z * 78.233) * 43758.5453 % 1) * 0.08 - 0.04;
+        const rgb = sampleColor(s, jit);
+        hGrid[i] = h;
         pos[i * 3] = x; pos[i * 3 + 1] = h; pos[i * 3 + 2] = z;
         col[i * 3] = lin(rgb[0]); col[i * 3 + 1] = lin(rgb[1]); col[i * 3 + 2] = lin(rgb[2]);
       }
     }
 
-    const indices = [];
-    for (let iz = 0; iz < N - 1; iz++) {
-      for (let ix = 0; ix < N - 1; ix++) {
-        const a = iz * N + ix, b = a + 1, c = a + N, d = c + 1;
-        if (out[a] > 38 && out[b] > 38 && out[c] > 38 && out[d] > 38) continue;
-        indices.push(a, c, b, b, c, d);
+    // quads belong to exactly one chunk: the tile owning their center
+    const idx = [];
+    for (let iz = 0; iz < nz - 1; iz++) {
+      for (let ix = 0; ix < nx - 1; ix++) {
+        const cx = (ixMin + ix + 0.5) * STEP, cz = (izMin + iz + 0.5) * STEP;
+        if (region.tileOf(cx, cz).id !== chunk.tileId) continue;
+        const a = iz * nx + ix, b = a + 1, c = a + nx, d = c + 1;
+        idx.push(a, c, b, b, c, d);
       }
     }
 
-    let geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
-    geo.setIndex(indices);
-    geo = geo.toNonIndexed();               // faceted low-poly shading
-    geo.computeVertexNormals();
-    this.terrain = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
-    this.terrain.receiveShadow = true;
-    this.group.add(this.terrain);
+    chunk.terrainData = { ixMin, izMin, nx, nz, pos, col, idx, hGrid };
   }
 
-  buildWater() {
-    const poly = this.map.poly;
-    const verts = [];
-    for (let i = 1; i < poly.length - 1; i++) {
-      verts.push(poly[0][0], WATER_Y, poly[0][1]);
-      verts.push(poly[i][0], WATER_Y, poly[i][1]);
-      verts.push(poly[i + 1][0], WATER_Y, poly[i + 1][1]);
-    }
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
-    geo.computeVertexNormals();
-    const mat = new THREE.MeshPhongMaterial({
-      color: 0x2486b8, transparent: true, opacity: 0.72,
-      shininess: 90, specular: 0x6699bb, side: THREE.DoubleSide,
-    });
-    const water = new THREE.Mesh(geo, mat);
-    water.renderOrder = 1;
-    this.group.add(water);
-  }
-
-  buildRivers() {
-    if (!this.map.rivers.length) return;
+  buildChunkRivers(chunk, g) {
+    if (!chunk.rivers.length) return;
     const verts = [];
     const up = new THREE.Vector3(0, 1, 0);
-    for (const path of this.map.rivers) {
+    const riverW = 3 + Math.min(chunk.flow, 10) * 0.35;
+    for (const path of chunk.rivers) {
       if (path.length < 2) continue;
-      // smooth the course in the horizontal plane, then drape it over the
-      // rendered terrain surface so it always sits in its carved channel
-      const pts = path.map((c) => new THREE.Vector3(c.x, 0, c.y));
+      const pts = path.map((p) => new THREE.Vector3(p.x, 0, p.y));
       const curve = new THREE.CatmullRomCurve3(pts);
       const n = path.length * 4;
-      const w = this.riverW / 2 + 2;
+      const w = riverW / 2 + 2;
       let prev = null;
       for (let i = 0; i <= n; i++) {
         const t = i / n;
         const p = curve.getPoint(t);
         const tan = curve.getTangent(t);
         const side = new THREE.Vector3().crossVectors(tan, up).setY(0).normalize().multiplyScalar(w);
-        const y = Math.max(this.meshHeightAt(p.x, p.z) + 0.45, WATER_Y - 0.1);
+        const y = Math.max(this.chunkHeightAt(chunk, p.x, p.z) + 0.45, WATER_Y - 0.1);
         const L = [p.x + side.x, y, p.z + side.z];
         const R = [p.x - side.x, y, p.z - side.z];
-        if (prev) {
-          verts.push(...prev.L, ...prev.R, ...L, ...L, ...prev.R, ...R);
-        }
+        if (prev) verts.push(...prev.L, ...prev.R, ...L, ...L, ...prev.R, ...R);
         prev = { L, R };
       }
     }
@@ -352,30 +400,29 @@ export class TerrainView {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
     geo.computeVertexNormals();
-    const mat = new THREE.MeshPhongMaterial({
+    const mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
       color: 0x2e9bd0, transparent: true, opacity: 0.85, shininess: 90,
       specular: 0x88bbdd, side: THREE.DoubleSide,
-    });
-    const mesh = new THREE.Mesh(geo, mat);
+    }));
     mesh.renderOrder = 2;
-    this.group.add(mesh);
+    g.add(mesh);
   }
 
   // ---------- props ----------
 
-  buildProps() {
-    const map = this.map;
-    const rng = mulberry32(map.tile.seed ^ 0x51ab73c1);
+  buildChunkProps(chunk, g) {
+    const region = this.region;
+    const rng = mulberry32(chunk.tile.seed ^ 0x51ab73c1);
     const trunks = [], cones = [], leafs = [], palms = [], cacti = [], rocks = [];
     const crystals = [], crops = [], corals = [];
     const animalSpots = [], fishSpots = [];
 
     const groundOk = (x, z) => {
-      if (this.distOutside(x, z) > 0) return -999;
-      return this.meshHeightAt(x, z);
+      if (region.tileOf(x, z).id !== chunk.tileId) return -999; // stay in chunk
+      return this.chunkHeightAt(chunk, x, z);
     };
 
-    for (const c of map.cells) {
+    for (const c of chunk.cells) {
       if (c.features.includes('tree')) {
         const isJungle = c.biome === 'jungle' || c.features.includes('oasis');
         const isConifer = c.biome === 'taiga' || (c.biome === 'forest' && rng() < 0.65) ||
@@ -409,7 +456,7 @@ export class TerrainView {
         const n = 2 + Math.floor(rng() * 3);
         for (let i = 0; i < n; i++) {
           const x = c.x + (rng() - 0.5) * HEXW, z = c.y + (rng() - 0.5) * HEXW;
-          const h = this.meshHeightAt(x, z);
+          const h = this.chunkHeightAt(chunk, x, z);
           if (h < WATER_Y - 0.8) corals.push({ x, z, h, s: 0.6 + rng(), t: rng() });
         }
       }
@@ -432,7 +479,6 @@ export class TerrainView {
           trunks.push({ x, z, h, s, palm: false });
         }
       } else if (!c.water) {
-        // mineral / material deposit: rock pile + colored crystals
         const color = CRYSTALS[res] ?? 0x8d8d92;
         const h0 = groundOk(c.x, c.y);
         if (h0 > 0.2) {
@@ -452,7 +498,6 @@ export class TerrainView {
       }
     }
 
-    // ---- instanced meshes ----
     const dummy = new THREE.Object3D();
     const colorObj = new THREE.Color();
     const addInstanced = (geom, mat, items, place) => {
@@ -467,7 +512,7 @@ export class TerrainView {
       });
       mesh.instanceMatrix.needsUpdate = true;
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      this.group.add(mesh);
+      g.add(mesh);
       return mesh;
     };
     const stdMat = () => new THREE.MeshLambertMaterial({ color: 0xffffff });
@@ -514,8 +559,8 @@ export class TerrainView {
       d.rotation.set(0.3, it.rot, 0.2);
       c.setHex(it.color);
     });
-    addInstanced(new THREE.BoxGeometry(9, 0.8, 2), stdMat(), cropsRows(crops), (it, d, c) => {
-      d.position.set(it.x, this.meshHeightAt(it.x, it.z) + 0.5, it.z);
+    addInstanced(new THREE.BoxGeometry(9, 0.8, 2), stdMat(), cropRows(crops), (it, d, c) => {
+      d.position.set(it.x, this.chunkHeightAt(chunk, it.x, it.z) + 0.5, it.z);
       d.rotation.set(0, it.rot, 0);
       c.setHex(it.color);
     });
@@ -526,19 +571,18 @@ export class TerrainView {
       c.setHex(it.t < 0.5 ? 0xd06a8a : 0x4ab8a8);
     });
 
-    this.buildAnimals(animalSpots, fishSpots, rng);
+    this.buildAnimals(animalSpots, fishSpots, rng, g);
   }
 
-  buildAnimals(animalSpots, fishSpots, rng) {
-    // generic low-poly quadruped: body + head + 4 legs
+  buildAnimals(animalSpots, fishSpots, rng, g) {
     const parts = [];
     const box = (w, h, d, x, y, z) => {
-      const g = new THREE.BoxGeometry(w, h, d);
-      g.translate(x, y, z);
-      return g;
+      const geom = new THREE.BoxGeometry(w, h, d);
+      geom.translate(x, y, z);
+      return geom;
     };
-    parts.push(box(3.2, 1.7, 1.5, 0, 2.1, 0));         // body
-    parts.push(box(1.1, 1.1, 1.1, 1.9, 3, 0));          // head
+    parts.push(box(3.2, 1.7, 1.5, 0, 2.1, 0));
+    parts.push(box(1.1, 1.1, 1.1, 1.9, 3, 0));
     parts.push(box(0.4, 1.5, 0.4, 1.2, 0.75, 0.5));
     parts.push(box(0.4, 1.5, 0.4, 1.2, 0.75, -0.5));
     parts.push(box(0.4, 1.5, 0.4, -1.2, 0.75, 0.5));
@@ -549,10 +593,9 @@ export class TerrainView {
     for (const { c, res } of animalSpots) {
       const kind = ANIMALS[res];
       for (let i = 0; i < kind.n; i++) {
-        const x = c.x + (rng() - 0.5) * HEXW * 2;
-        const z = c.y + (rng() - 0.5) * HEXW * 2;
         herd.push({
-          x, z, home: [c.x, c.y], ang: rng() * 6.28,
+          x: c.x + (rng() - 0.5) * HEXW * 2, z: c.y + (rng() - 0.5) * HEXW * 2,
+          home: [c.x, c.y], ang: rng() * 6.28,
           speed: 2.5 + rng() * 2.5, s: kind.s, color: kind.c, water: false,
         });
       }
@@ -572,7 +615,6 @@ export class TerrainView {
       }
     }
 
-    const dummy = new THREE.Object3D();
     const colorObj = new THREE.Color();
     if (herd.length) {
       const mesh = new THREE.InstancedMesh(quad, new THREE.MeshLambertMaterial({ color: 0xffffff }), herd.length);
@@ -582,22 +624,22 @@ export class TerrainView {
         mesh.setColorAt(i, colorObj);
       });
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      this.group.add(mesh);
+      g.add(mesh);
       this.movers.push({ mesh, items: herd });
     }
     if (school.length) {
       const fin = new THREE.ConeGeometry(0.8, 2.6, 4);
-      fin.rotateX(Math.PI / 2); // point forward
+      fin.rotateX(Math.PI / 2);
       const mesh = new THREE.InstancedMesh(fin, new THREE.MeshLambertMaterial({ color: 0xffffff }), school.length);
       school.forEach((a, i) => {
         colorObj.setHex(a.color);
         mesh.setColorAt(i, colorObj);
       });
       if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-      this.group.add(mesh);
+      g.add(mesh);
       this.movers.push({ mesh, items: school });
     }
-    this.moverDummy = dummy;
+    if (!this.moverDummy) this.moverDummy = new THREE.Object3D();
   }
 
   animate(dt) {
@@ -606,7 +648,6 @@ export class TerrainView {
     for (const { mesh, items } of this.movers) {
       items.forEach((a, i) => {
         if (a.water) {
-          // swim in lazy circles around home
           a.ang += a.speed * dt;
           a.x = a.home[0] + Math.cos(a.ang) * a.radius;
           a.z = a.home[1] + Math.sin(a.ang) * a.radius;
@@ -623,8 +664,9 @@ export class TerrainView {
           }
           const nx = a.x + Math.cos(a.ang) * a.speed * dt;
           const nz = a.z + Math.sin(a.ang) * a.speed * dt;
+          const owner = this.region.tileOf(nx, nz);
           const h = this.meshHeightAt(nx, nz);
-          if (h < 0.6 || this.distOutside(nx, nz) > 0) {
+          if (h < 0.6 || !this.region.discovered.has(owner.id)) {
             a.ang += Math.PI / 2;
           } else {
             a.x = nx; a.z = nz; a.h = h;
@@ -649,11 +691,11 @@ export class TerrainView {
       downY = e.clientY;
     });
     this.canvas.addEventListener('pointerup', (e) => {
-      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return; // drag
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return;
       this.handleClick(e.clientX, e.clientY);
     });
     this.canvas.addEventListener('pointermove', (e) => {
-      if (!this.placementMode || !this.map) return;
+      if (!this.placementMode || !this.region) return;
       const hit = this.groundPoint(e.clientX, e.clientY);
       if (!hit) {
         this.ghost.visible = false;
@@ -674,21 +716,22 @@ export class TerrainView {
   }
 
   groundPoint(clientX, clientY) {
-    if (!this.terrain) return null;
+    if (!this.terrains.length) return null;
     this.setRay(clientX, clientY);
-    const hits = this.raycaster.intersectObject(this.terrain, false);
+    const hits = this.raycaster.intersectObjects(this.terrains, false);
     return hits.length ? hits[0].point : null;
   }
 
   validSite(x, z) {
-    if (this.distOutside(x, z) > 0) return false;
+    const owner = this.inRegion(x, z);
+    if (!owner || !this.region.discovered.has(owner.id)) return false;
     const h = this.meshHeightAt(x, z);
     if (h < 0.8) return false;
     for (const d of [[14, 0], [-14, 0], [0, 14], [0, -14]]) {
       const hh = this.meshHeightAt(x + d[0], z + d[1]);
-      if (hh < 0.8 || Math.abs(hh - h) > 6) return false; // water or too steep
+      if (hh < 0.8 || Math.abs(hh - h) > 6) return false;
     }
-    for (const s of this.map.settlements) {
+    for (const s of this.region.settlements) {
       if (Math.hypot(s.x - x, s.z - z) < 55) return false;
     }
     return true;
@@ -697,15 +740,12 @@ export class TerrainView {
   togglePlacement(on = !this.placementMode) {
     this.placementMode = on;
     if (!on) this.ghost.visible = false;
-    if (on) {
-      this.selectedCiv = null;
-      this.civRing.visible = false;
-    }
+    if (on) this.deselectCiv();
     this.onPlacement?.(on);
   }
 
   handleClick(clientX, clientY) {
-    if (!this.map) return;
+    if (!this.region) return;
     if (this.placementMode) {
       const hit = this.groundPoint(clientX, clientY);
       if (hit && this.validSite(hit.x, hit.z)) {
@@ -715,7 +755,6 @@ export class TerrainView {
       return;
     }
     this.setRay(clientX, clientY);
-    // villagers first, then settlements, then ground
     let hits = this.raycaster.intersectObjects(this.civMeshes, true);
     if (hits.length) {
       let o = hits[0].object;
@@ -736,24 +775,35 @@ export class TerrainView {
         return;
       }
     }
-    const hit = this.groundPoint(clientX, clientY);
-    if (!hit) return;
     if (this.selectedCiv) {
-      // move order — only onto walkable ground
-      if (this.meshHeightAt(hit.x, hit.z) > 0.6 && this.distOutside(hit.x, hit.z) === 0) {
-        this.selectedCiv.target = [hit.x, hit.z];
-        this.moveMarker.position.set(hit.x, this.meshHeightAt(hit.x, hit.z) + 0.4, hit.z);
-        this.moveMarker.visible = true;
+      // move order: terrain or fog (villagers march into the unknown)
+      const targets = [...this.terrains, ...this.fogSlabs.values()];
+      const tHits = this.raycaster.intersectObjects(targets, false);
+      if (tHits.length) {
+        const p = tHits[0].point;
+        const owner = this.inRegion(p.x, p.z);
+        if (owner) {
+          this.selectedCiv.target = [p.x, p.z];
+          this.moveMarker.position.set(p.x, Math.max(this.meshHeightAt(p.x, p.z), 0) + 0.4, p.z);
+          this.moveMarker.visible = true;
+        }
       }
       return;
     }
-    const r = Math.round(hit.z / ROWH);
-    const q = Math.round(hit.x / HEXW - r / 2);
-    const cell = this.map.byKey.get(q + ',' + r) || null;
+    const hit = this.groundPoint(clientX, clientY);
+    if (!hit) return;
+    const cell = this.cellAtPoint(hit.x, hit.z);
     if (cell) {
       this.setSelected(cell);
       this.onInfo?.(cell);
     }
+  }
+
+  cellAtPoint(x, z) {
+    const r = Math.round(z / ROWH);
+    const q = Math.round(x / HEXW - r / 2);
+    const cell = this.region.cells.get(q + ',' + r);
+    return cell && this.region.discovered.has(cell.tid) ? cell : null;
   }
 
   deselectCiv() {
@@ -763,7 +813,7 @@ export class TerrainView {
   }
 
   foundSettlement(x, z) {
-    const rng = mulberry32((Math.round(x) * 31 + Math.round(z) * 7) ^ this.map.tile.seed);
+    const rng = mulberry32((Math.round(x) * 31 + Math.round(z) * 7) ^ this.region.anchor.seed);
     const SYL = ['ka', 'zor', 'rim', 'tha', 'vel', 'un', 'dra', 'mo', 'qui', 'lex',
       'ar', 'ten', 'bel', 'os', 'nia', 'gul', 'fer', 'wyn', 'ash', 'tor'];
     let name = '';
@@ -772,7 +822,7 @@ export class TerrainView {
     name = name[0].toUpperCase() + name.slice(1);
 
     const s = { x, z, name, founded: Date.now() };
-    this.map.settlements.push(s);
+    this.region.settlements.push(s);
     this.addSettlementMeshes(s);
 
     const CLOTHES = [0x4a7ab5, 0xb55a4a, 0x5ab55a, 0xb5a04a, 0x8a5ab5, 0x4ab5a8];
@@ -783,14 +833,14 @@ export class TerrainView {
         color: CLOTHES[Math.floor(rng() * CLOTHES.length)],
         home: name, target: null, speed: 9, phase: rng() * 6.28,
       };
-      this.map.civs.push(civ);
+      this.region.civs.push(civ);
       this.addCivMesh(civ);
     }
     this.onSettlement?.(s);
   }
 
   addSettlementMeshes(s) {
-    const rng = mulberry32((Math.round(s.x) * 31 + Math.round(s.z) * 7) ^ this.map.tile.seed);
+    const rng = mulberry32((Math.round(s.x) * 31 + Math.round(s.z) * 7) ^ this.region.anchor.seed);
     const g = new THREE.Group();
     const h = this.meshHeightAt(s.x, s.z);
     const wall = new THREE.MeshLambertMaterial({ color: 0xc9a876 });
@@ -799,14 +849,12 @@ export class TerrainView {
     const padM = new THREE.MeshLambertMaterial({ color: 0x8a7a62 });
 
     const pad = new THREE.Mesh(new THREE.CylinderGeometry(16, 18, 2.4, 8), padM);
-    pad.position.set(0, 0, 0);
     g.add(pad);
 
     const house = (w, hh, d, mat) => {
       const hg = new THREE.Group();
       const body = new THREE.Mesh(new THREE.BoxGeometry(w, hh, d), mat);
       body.position.y = hh / 2;
-      // triangular prism roof: 3-sided cylinder laid along X, apex up
       const r = d * 0.72;
       const roofGeo = new THREE.CylinderGeometry(r, r, w * 1.08, 3, 1);
       roofGeo.rotateZ(Math.PI / 2);
@@ -856,7 +904,7 @@ export class TerrainView {
   }
 
   updateCivs(dt, t) {
-    for (const civ of this.map.civs) {
+    for (const civ of this.region.civs) {
       const g = civ.mesh;
       if (!g) continue;
       let bob = 0;
@@ -870,14 +918,21 @@ export class TerrainView {
           const step = Math.min(dist, civ.speed * dt);
           const nx = civ.x + (dx / dist) * step;
           const nz = civ.z + (dz / dist) * step;
-          if (this.meshHeightAt(nx, nz) > 0.6) {
+          const owner = this.inRegion(nx, nz);
+          let blocked = !owner;
+          if (owner && !this.region.discovered.has(owner.id)) {
+            this.discoverTile(owner.id); // a settler walks into the fog
+          }
+          // villagers ford carved river channels but refuse real water
+          if (!blocked && this.region.sample(nx, nz).water) blocked = true;
+          if (blocked) {
+            civ.target = null;
+            if (this.selectedCiv === civ) this.moveMarker.visible = false;
+          } else {
             civ.x = nx;
             civ.z = nz;
             g.rotation.y = -Math.atan2(dz, dx) + Math.PI / 2;
             bob = Math.abs(Math.sin(t * 11 + civ.phase)) * 0.5;
-          } else {
-            civ.target = null; // refuses to swim
-            if (this.selectedCiv === civ) this.moveMarker.visible = false;
           }
         }
       }
@@ -896,26 +951,8 @@ export class TerrainView {
   // hover probe for the terrain tooltip
   probe(clientX, clientY) {
     const hit = this.groundPoint(clientX, clientY);
-    if (!hit || this.distOutside(hit.x, hit.z) > 0) return null;
-    const r = Math.round(hit.z / ROWH);
-    const q = Math.round(hit.x / HEXW - r / 2);
-    return this.map.byKey.get(q + ',' + r) || null;
-  }
-
-  // ---------- picking ----------
-
-  pick(clientX, clientY) {
-    if (!this.terrain) return null;
-    const rect = this.canvas.getBoundingClientRect();
-    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hits = this.raycaster.intersectObject(this.terrain, false);
-    if (!hits.length) return null;
-    const { x, z } = hits[0].point;
-    const r = Math.round(z / ROWH);
-    const q = Math.round(x / HEXW - r / 2);
-    return this.map.byKey.get(q + ',' + r) || null;
+    if (!hit) return null;
+    return this.cellAtPoint(hit.x, hit.z);
   }
 
   setSelected(cell) {
@@ -938,14 +975,13 @@ export class TerrainView {
     }
     const dt = Math.min(this.clock.getDelta(), 0.1);
     this.animate(dt);
-    if (this.map) this.updateCivs(dt, this.clock.elapsedTime);
+    if (this.region) this.updateCivs(dt, this.clock.elapsedTime);
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
 }
 
-// each crop deposit becomes a few field rows
-function cropsRows(crops) {
+function cropRows(crops) {
   const rows = [];
   for (const f of crops) {
     for (let i = -1; i <= 1; i++) {

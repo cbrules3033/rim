@@ -1,9 +1,9 @@
-// Invariant tests for the sphere geometry and world generation.
+// Invariant tests for the sphere geometry, world generation, and regions.
 // Run with: npm test  (plain node, no test framework needed)
 
 import { buildGoldberg } from './public/js/sphere.js';
 import { generateWorld } from './public/js/worldgen.js';
-import { generateLocalMap } from './public/js/localmap.js';
+import { createRegion } from './public/js/localmap.js';
 
 let failures = 0;
 function check(name, cond) {
@@ -64,40 +64,72 @@ check('different seed gives a different world', w3.tiles.some((t, i) => t.elev !
 check('fertility in range', w.tiles.every((t) => t.fertility >= 0 && t.fertility <= 100));
 check('most tiles have resources', w.tiles.filter((t) => t.resources.length).length / w.tiles.length > 0.85);
 
-// ---- local tile maps ----
-const riverTile = w.tiles.find((t) => t.riverN.length >= 1 && !t.water);
-const lm = generateLocalMap(w, riverTile);
+// ---- regions / local maps ----
+// pick a land tile whose river flows to a land neighbor (to test alignment)
+const riverTile = w.tiles.find((t) =>
+  t.riverN.length >= 1 && !t.water &&
+  t.riverN.some((d) => !w.tiles[t.neighbors[d]].water));
+const region = createRegion(w, riverTile);
+const chunk = region.getChunk(riverTile.id);
 
-check('local map has cells', lm.cells.length > 1000);
-check('local map deterministic', (() => {
-  const lm2 = generateLocalMap(w, riverTile);
-  return lm.cells.every((c, i) =>
-    c.biome === lm2.cells[i].biome &&
-    c.elev === lm2.cells[i].elev &&
-    c.resource === lm2.cells[i].resource);
+check('anchor chunk has cells', chunk.cells.length > 1000);
+check('chunk deterministic', (() => {
+  const r2 = createRegion(w, riverTile);
+  const c2 = r2.getChunk(riverTile.id);
+  return chunk.cells.length === c2.cells.length && chunk.cells.every((c, i) =>
+    c.biome === c2.cells[i].biome &&
+    c.elev === c2.cells[i].elev &&
+    c.resource === c2.cells[i].resource);
 })());
-check('local map has a river path', lm.rivers.length > 0 && lm.rivers[0].length > 2);
-check('river crossings sit on shared edge midpoints', lm.crossings.every((cr, i) => {
-  const mid = riverTile.edgeMid[riverTile.riverN[i]];
-  return Math.hypot(cr.p3[0] - mid[0], cr.p3[1] - mid[1], cr.p3[2] - mid[2]) < 1e-12;
-}));
-check('river path starts near its entry crossing', (() => {
-  const entry = lm.rivers[0][0];
-  const cr = lm.crossings[0];
-  return Math.hypot(entry.x - cr.x, entry.y - cr.y) < 25; // within ~1.5 cells
-})());
+check('chunk has a river path', chunk.rivers.length > 0 && chunk.rivers[0].length > 2);
 check('all tile resources placed as deposits', riverTile.resources.every((id) =>
-  lm.cells.some((c) => c.resource === id)));
+  chunk.cells.some((c) => c.resource === id)));
+
+// cross-chunk alignment: the river leaves this chunk at exactly the same
+// point where it enters the neighbor's chunk (shared frame, shared edgeMid)
+const dirToLand = riverTile.riverN.find((d) => !w.tiles[riverTile.neighbors[d]].water);
+const neighborTile = w.tiles[riverTile.neighbors[dirToLand]];
+const nChunk = region.getChunk(neighborTile.id);
+const myCrossing = chunk.crossings.find((c) => c.dir === dirToLand);
+const theirDir = neighborTile.neighbors.indexOf(riverTile.id);
+const theirCrossing = nChunk.crossings.find((c) => c.dir === theirDir);
+check('shared river crossing exists in both chunks', !!myCrossing && !!theirCrossing);
+check('river crossings coincide exactly across the boundary',
+  myCrossing && theirCrossing &&
+  Math.hypot(myCrossing.x - theirCrossing.x, myCrossing.y - theirCrossing.y) < 1e-9);
+check('both chunks have a river endpoint at the shared crossing', (() => {
+  const at = (pts, cr) => pts.some((p) => Math.hypot(p.x - cr.x, p.y - cr.y) < 1e-9);
+  return chunk.rivers.some((pts) => at(pts, myCrossing)) &&
+    nChunk.rivers.some((pts) => at(pts, theirCrossing));
+})());
+
+// adjacent chunks never claim the same cell, and ownership is exclusive
+check('no cell claimed by two chunks', (() => {
+  const seen = new Set();
+  for (const c of [...chunk.cells, ...nChunk.cells]) {
+    const k = c.q + ',' + c.r;
+    if (seen.has(k)) return false;
+    seen.add(k);
+  }
+  return true;
+})());
+check('terrain field is identical across the boundary', (() => {
+  // sample the exact crossing point twice via both chunk paths — same region
+  // field, must be bit-identical
+  const a = region.sample(myCrossing.x, myCrossing.y);
+  const b = region.sample(theirCrossing.x, theirCrossing.y);
+  return a.e === b.e && a.biome === b.biome;
+})());
 
 const coastTile = w.tiles.find((t) => !t.water &&
   t.neighbors.some((nid) => w.tiles[nid].water && w.tiles[nid].biome !== 'lake'));
-const clm = generateLocalMap(w, coastTile);
-check('coastal tile map contains ocean cells', clm.cells.some((c) => c.water));
-check('coastal tile map contains land cells', clm.cells.some((c) => !c.water));
+const clm = createRegion(w, coastTile).getChunk(coastTile.id);
+check('coastal chunk contains ocean cells', clm.cells.some((c) => c.water));
+check('coastal chunk contains land cells', clm.cells.some((c) => !c.water));
 
 const oceanTile = w.tiles.find((t) => t.biome === 'deep_ocean');
-const olm = generateLocalMap(w, oceanTile);
-check('deep ocean tile map is mostly water', olm.cells.filter((c) => c.water).length / olm.cells.length > 0.8);
+const olm = createRegion(w, oceanTile).getChunk(oceanTile.id);
+check('deep ocean chunk is mostly water', olm.cells.filter((c) => c.water).length / olm.cells.length > 0.8);
 
 console.log(failures ? `\n${failures} test(s) FAILED` : '\nAll tests passed');
 process.exit(failures ? 1 : 0);

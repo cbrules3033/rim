@@ -120,6 +120,27 @@ main { position: relative; flex: 1; min-height: 0; }
 }
 #tooltip .dim { margin-left: 6px; }
 
+#toast {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  padding: 9px 22px;
+  font-size: 15px;
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0;
+}
+#toast.show { animation: toast 3.2s ease forwards; }
+@keyframes toast {
+  0% { opacity: 0; transform: translateX(-50%) translateY(-8px); }
+  10%, 80% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  100% { opacity: 0; }
+}
+
 .explore-btn {
   width: 100%;
   margin-top: 14px;

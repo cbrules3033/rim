@@ -1,5 +1,5 @@
 import { generateWorld } from './worldgen.js';
-import { generateLocalMap } from './localmap.js';
+import { createRegion } from './localmap.js';
 import { Globe } from './globe.js';
 import { TerrainView } from './terrain3d.js';
 import { showTile, showCell, showSettlement, showStats } from './ui.js';
@@ -16,7 +16,7 @@ const locEl = document.getElementById('loc');
 const hintEl = document.getElementById('hint');
 
 const globe = new Globe(canvas);
-const mapView = new TerrainView(mapCanvas, (cell) => showCell(cell));
+const mapView = new TerrainView(mapCanvas);
 
 let world = null;
 let mode = 'globe';
@@ -42,12 +42,13 @@ function generate(seed) {
 // ---- globe <-> local map view switching ----
 function enterTile(tile) {
   if (!tile || mode === 'map') return;
-  let lm = mapCache.get(tile.id);
-  if (!lm) {
-    lm = generateLocalMap(world, tile);
-    mapCache.set(tile.id, lm);
+  let region = mapCache.get(tile.id);
+  if (!region) {
+    region = createRegion(world, tile);
+    region.getChunk(tile.id);
+    mapCache.set(tile.id, region);
   }
-  mapView.setMap(lm);
+  mapView.setMap(region);
   mode = 'map';
   document.body.classList.add('map-mode');
   locEl.textContent = `${BIOMES[tile.biome].name} · tile #${tile.id}`;
@@ -84,8 +85,16 @@ seedInput.addEventListener('keydown', (e) => {
 // ---- local map interactions (TerrainView handles its own clicks) ----
 mapView.onInfo = (cell) => showCell(cell);
 mapView.onSettlement = (s) => {
-  const pop = mapView.map.civs.filter((c) => c.home === s.name).length;
+  const pop = mapView.region.civs.filter((c) => c.home === s.name).length;
   showSettlement(s, pop);
+};
+mapView.onDiscover = (tile) => {
+  const toast = document.getElementById('toast');
+  toast.textContent = `🌄 Discovered: ${BIOMES[tile.biome].name}`;
+  toast.classList.remove('hidden');
+  toast.classList.remove('show');
+  void toast.offsetWidth; // restart animation
+  toast.classList.add('show');
 };
 const settleBtn = document.getElementById('settle');
 mapView.onPlacement = (active) => settleBtn.classList.toggle('active', active);

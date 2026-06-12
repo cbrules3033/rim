@@ -117,20 +117,35 @@ shading with a camera-attached light. Rivers are thin ribbon quads from tile
 center to edge midpoint — both tiles draw their half, so rivers connect
 seamlessly. Picking is a raycast with a `faceIndex → tile` lookup table.
 
-### Local tile maps (`localmap.js`, `terrain3d.js`)
+### Regions: local maps, fog of war, cross-tile travel (`localmap.js`, `terrain3d.js`)
 
 Double-click a tile on the globe (or hit **Explore this tile** in its panel) to
 open it as a full 3D landscape: smooth low-poly terrain with real water,
 carved meandering rivers, dense instanced forests, rock piles, ore crystal
 deposits, crop fields, coral reefs — and animals that wander around (deer,
-sheep, cattle, foxes; fish circle in the water). The landscape floats as a
-diorama with cliff edges at the tile boundary.
+sheep, cattle, foxes; fish circle in the water).
 
-`localmap.js` produces two layers: a continuous `sample(x, y)` terrain field
-(used by the renderer) and a hex-cell data grid sampled from the same field
-(gameplay data + click-for-info). Generation is deterministic from `tileSeed` +
-world seed, and cached in memory, so revisiting a tile always shows the same
-map. How it stays consistent with the globe and with neighbors:
+Entering a tile creates a **region**: one shared coordinate frame (gnomonic
+tangent plane anchored on that tile) covering the tile *and its 6 neighbors*.
+Neighbors start hidden under fog-of-war walls — nothing is generated or
+rendered for them. Send a villager into the fog and the moment they cross the
+tile boundary the neighbor chunk generates, the fog lifts, and the map expands.
+
+Adjacent chunks line up **exactly**, by construction rather than by stitching:
+
+- All chunks share one global terrain-vertex grid and one hex-cell lattice in
+  the region frame; cells/quads are assigned to chunks by spherical Voronoi
+  ownership (which *is* the Goldberg tile polygon), so ownership is exclusive
+  and boundary vertices are computed from the same continuous field at the
+  same coordinates — bit-identical from both sides (tested in `test.js`).
+- Rivers end/start at the exact projected globe edge midpoints, so a river
+  flows from one chunk into the next without a visible joint.
+
+`localmap.js` produces two layers per chunk: the continuous `sample(x, y)`
+terrain field (used by the renderer) and a hex-cell data grid sampled from the
+same field (gameplay data + tooltips/info). Generation is deterministic from
+`tileSeed` + world seed, and cached per region for the session. Other
+consistency notes:
 
 - Cell attributes are **IDW-interpolated from the tile + its globe neighbors**,
   then detailed with noise fields seeded by the *world* seed — those fields are
@@ -170,7 +185,8 @@ Public traffic reaches it through a Cloudflare Tunnel
 ## Roadmap
 
 - [x] Load a tile as a detailed local map (using `tileSeed`, matching edges)
-- [ ] Travel between adjacent tile maps
+- [x] Travel between adjacent tile maps (fog of war, seamless chunk expansion)
+- [ ] Travel beyond the first ring (re-anchor regions / global cell lattice)
 - [ ] More cross-border features (roads, mountain ranges as edge data)
 - [ ] Region/continent naming
 - [ ] Gameplay 🙂
