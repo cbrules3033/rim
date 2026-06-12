@@ -1,5 +1,11 @@
-// Local tile-map generation: expands one globe tile into a playable-scale hex
-// map. Deterministic from the tile's seed + the world seed.
+// Local tile-map generation: expands one globe tile into a playable-scale
+// landscape. Deterministic from the tile's seed + the world seed.
+//
+// Two layers:
+// - `sample(x, y)` — a continuous terrain field (elevation/climate/biome/
+//   color at any point), used by the 3D landscape renderer.
+// - `cells` — a hex-cell data layer sampled from the same field, carrying
+//   gameplay data (features, resource deposits, fertility) and info panels.
 //
 // Cohesion guarantees:
 // - Terrain attributes are interpolated from this tile + its neighbors and
@@ -15,9 +21,9 @@ import { BIOMES, RESOURCES, hexToRgb, rgbStr, shade, mix } from './defs.js';
 
 export const CELL = 10;                       // hex cell size (map units)
 export const HEXW = Math.sqrt(3) * CELL;      // cell horizontal spacing
-export const ROWH = 1.5 * CELL;               // cell row spacing (unsquashed)
+export const ROWH = 1.5 * CELL;               // cell row spacing
 const GRID_R = 30;                            // cell rings to cover the tile
-const POLY_R = GRID_R * ROWH * 0.96;          // target polygon radius (map units)
+export const POLY_R = GRID_R * ROWH * 0.96;   // target polygon radius (map units)
 
 // axial hex neighbors (pointy-top): E, NE, NW, W, SW, SE
 const ADIRS = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
@@ -108,13 +114,48 @@ export function generateLocalMap(world, tile) {
     return val / normAmp;
   };
 
-  // ---- deterministic per-tile feature anchors ----
+  // ---- deterministic feature anchors (independent of cell-loop rng order) ----
   const isVolcano = tile.features.includes('volcano');
   const isOasis = tile.features.includes('oasis');
   const isLake = tile.biome === 'lake';
-  const oasisAt = [(rng() - 0.5) * POLY_R, (rng() - 0.5) * POLY_R];
+  const anchorRng = mulberry32(hashSeed(world.seed + ':anchor:' + tile.id));
+  const oasisAt = [(anchorRng() - 0.5) * POLY_R * 0.8, (anchorRng() - 0.5) * POLY_R * 0.8];
 
-  // ---- build cells ----
+  // ---- the continuous terrain field ----
+  function sample(x, y) {
+    const p3 = to3D(x, y);
+    const base = interp(p3);
+    let e = base.e
+      + fbm(elevN, p3, 70, 4) * 0.05
+      + fbm(elevN2, p3, 260, 2) * 0.018;
+
+    const dc = Math.hypot(x, y) / POLY_R; // 0 center .. ~1 edge
+    if (isVolcano) {
+      const cone = Math.max(0, 1 - dc * 2.1);
+      e += cone * cone * 0.3;
+      if (dc < 0.09) e -= 0.12; // crater
+    }
+    if (isLake) e -= Math.max(0, 1 - dc * 1.5) * 0.5 * sea;
+    if (isOasis) {
+      const d = Math.hypot(x - oasisAt[0], y - oasisAt[1]);
+      if (d < CELL * 2.4) e = Math.min(e, sea - 0.015 - (1 - d / (CELL * 2.4)) * 0.01);
+    }
+
+    const water = e < sea;
+    const elevAbove = water ? 0 : (e - sea) / (1 - sea);
+    const depth = water ? Math.min(1, (sea - e) / sea) : 0;
+    const T = base.T - (elevAbove - tile.elevAbove) * 10;
+    const m = Math.max(0, Math.min(1, base.m + fbm(moistN, p3, 90, 2) * 0.09));
+
+    let biome;
+    if (water) biome = (isLake || isOasis) ? 'lake' : depth > 0.25 ? 'ocean' : 'shallows';
+    else if (e < sea + 0.012 && T > 2) biome = 'beach';
+    else biome = classifyBiome(elevAbove, T, m);
+
+    return { e, elevAbove, depth, water, temp: T, moist: m, biome };
+  }
+
+  // ---- hex-cell data layer ----
   const cells = [];
   const byKey = new Map();
   for (let q = -GRID_R - 2; q <= GRID_R + 2; q++) {
@@ -122,37 +163,15 @@ export function generateLocalMap(world, tile) {
       const x = HEXW * (q + r / 2);
       const y = ROWH * r;
       if (!pointInPoly(x, y, poly)) continue;
-      const p3 = to3D(x, y);
-      const base = interp(p3);
-
-      let e = base.e
-        + fbm(elevN, p3, 70, 4) * 0.05
-        + fbm(elevN2, p3, 260, 2) * 0.018;
-
-      // feature shaping
-      const dc = Math.hypot(x, y) / POLY_R; // 0 center .. ~1 edge
-      if (isVolcano) {
-        const cone = Math.max(0, 1 - dc * 2.1);
-        e += cone * cone * 0.3;
-        if (dc < 0.09) e -= 0.12; // crater
-      }
-      if (isLake) e -= Math.max(0, 1 - dc * 1.5) * 0.5 * (sea - 0); // dish toward center
-
-      const water = e < sea;
-      const elevAbove = water ? 0 : (e - sea) / (1 - sea);
-      const depth = water ? Math.min(1, (sea - e) / sea) : 0;
-      const T = base.T - (elevAbove - tile.elevAbove) * 10;
-      let m = Math.max(0, Math.min(1, base.m + fbm(moistN, p3, 90, 2) * 0.09));
-
+      const s = sample(x, y);
       const cell = {
         q, r, x, y,
-        elev: e, elevAbove, depth, water,
-        temp: Math.round(T * 10) / 10, moist: m,
-        biome: water ? (depth > 0.25 ? 'ocean' : 'shallows') : classifyBiome(elevAbove, T, m),
+        elev: s.e, elevAbove: s.elevAbove, depth: s.depth, water: s.water,
+        temp: Math.round(s.temp * 10) / 10, moist: s.moist,
+        biome: s.biome,
         features: [],
         resource: null, river: false,
       };
-      if (isLake && water) cell.biome = 'lake';
       cells.push(cell);
       byKey.set(q + ',' + r, cell);
     }
@@ -160,32 +179,17 @@ export function generateLocalMap(world, tile) {
   const cellAt = (q, r) => byKey.get(q + ',' + r);
   const cellNbrs = (c) => ADIRS.map(([dq, dr]) => cellAt(c.q + dq, c.r + dr)).filter(Boolean);
 
-  // ---- oasis pond ----
-  if (isOasis) {
-    for (const c of cells) {
-      const d = Math.hypot(c.x - oasisAt[0], c.y - oasisAt[1]);
-      if (d < CELL * 2.2) {
-        c.water = true;
-        c.biome = 'lake';
-        c.depth = 0.05;
-        c.elevAbove = 0;
-      } else if (d < CELL * 4.5) {
-        c.biome = 'jungle';
-        c.features.push('oasis');
-      }
-    }
-  }
-
-  // ---- beaches, sea ice, reefs ----
+  // ---- per-cell features ----
   const isReef = tile.features.includes('reef');
   for (const c of cells) {
-    if (!c.water && c.elevAbove < 0.09 && c.temp > 2 &&
-        !['swamp', 'marsh'].includes(c.biome) && cellNbrs(c).some((nc) => nc.water)) {
-      c.biome = 'beach';
-    }
     if (c.water && c.temp < -6) c.features.push('sea_ice');
     if (isReef && c.water && c.depth < 0.2 && rng() < 0.2) c.features.push('reef');
     if (isVolcano && Math.hypot(c.x, c.y) / POLY_R < 0.14 && !c.water) c.features.push('volcano');
+    if (isOasis && !c.water &&
+        Math.hypot(c.x - oasisAt[0], c.y - oasisAt[1]) < CELL * 4.5) {
+      c.biome = 'jungle';
+      c.features.push('oasis');
+    }
   }
 
   // ---- rivers: enter/exit at the globe's shared edge midpoints ----
@@ -254,10 +258,12 @@ export function generateLocalMap(world, tile) {
   // ---- trees & scatter features ----
   const TREE_DENSITY = { forest: 0.5, seasonal_forest: 0.5, jungle: 0.65, taiga: 0.45, swamp: 0.25, marsh: 0.15 };
   for (const c of cells) {
+    if (c.water || c.river) continue;
     const td = TREE_DENSITY[c.biome];
-    if (td && rng() < td) c.features.push('tree');
+    if (td && rng() < td + 0.25) c.features.push('tree'); // landscapes want dense woods
     else if (c.biome === 'desert' && rng() < 0.05) c.features.push('cactus');
     else if ((c.biome === 'mountain' || c.biome === 'peak') && rng() < 0.12) c.features.push('rocks');
+    else if (c.features.includes('oasis') && rng() < 0.5) c.features.push('tree');
   }
 
   // ---- resource deposits ----
@@ -267,6 +273,7 @@ export function generateLocalMap(world, tile) {
     let candidates = cells.filter((c) =>
       !c.resource && c.water === water &&
       (!high || c.elevAbove > 0.25 || c.water));
+    if (!candidates.length && water) candidates = cells.filter((c) => !c.resource && c.river);
     if (!candidates.length) candidates = cells.filter((c) => !c.resource);
     if (high) candidates = candidates.sort((a, b) => b.elev - a.elev).slice(0, Math.max(30, candidates.length >> 2));
     const count = 2 + Math.floor(rng() * 3);
@@ -291,26 +298,37 @@ export function generateLocalMap(world, tile) {
   return {
     tileId: tile.id,
     tile,
-    cells, poly, rivers,
-    crossings, // {dir, x, y, p3} — p3 is the exact shared edge midpoint
+    sample,            // continuous terrain field for the landscape renderer
+    sea,
+    cells, byKey, poly, rivers,
+    crossings,         // {dir, x, y, p3} — p3 is the exact shared edge midpoint
     genMs: Math.round(performance.now() - t0),
   };
 }
 
-function colorCell(c, rng) {
-  let rgb = hexToRgb(BIOMES[c.biome].color);
-  if (c.water && c.biome !== 'lake') {
-    rgb = mix(hexToRgb(BIOMES.shallows.color), hexToRgb(BIOMES.deep_ocean.color), Math.min(1, c.depth * 1.8));
-  } else if (!c.water) {
-    rgb = shade(rgb, c.elevAbove * 0.25);
+// css/srgb color for a sampled point (vertex colors handle linear conversion)
+export function sampleColor(s, jitter = 0) {
+  let rgb;
+  if (s.water && s.biome !== 'lake') {
+    // seabed: sandy shallows fading to deep blue
+    rgb = mix([196, 178, 128], [16, 38, 64], Math.min(1, s.depth * 2.2));
+  } else if (s.water) {
+    rgb = mix([150, 142, 110], [24, 52, 70], Math.min(1, s.depth * 4));
+  } else {
+    rgb = hexToRgb(BIOMES[s.biome].color);
+    rgb = shade(rgb, s.elevAbove * 0.25);
   }
+  if (jitter) rgb = shade(rgb, jitter);
+  return rgb;
+}
+
+function colorCell(c, rng) {
+  let rgb = sampleColor(c);
   if (c.features.includes('sea_ice')) rgb = mix(rgb, [225, 238, 246], 0.7);
   if (c.features.includes('reef')) rgb = mix(rgb, [120, 200, 190], 0.4);
   if (c.features.includes('volcano')) rgb = mix(rgb, [70, 52, 48], 0.55);
   rgb = shade(rgb, (rng() - 0.5) * 0.08);
   c.color = rgbStr(rgb);
-  c.sideColor1 = rgbStr(shade(rgb, -0.35));
-  c.sideColor2 = rgbStr(shade(rgb, -0.5));
 }
 
 export function cellIcon(c) {

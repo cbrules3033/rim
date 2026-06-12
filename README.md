@@ -51,7 +51,7 @@ public/
     localmap.js             ★ expands one tile into a playable-scale hex map
     defs.js                 ★ biome/resource tables, colors, labels
     globe.js               Three.js renderer (tiles, rivers, picking, controls)
-    mapview.js             isometric canvas renderer for local tile maps
+    terrain3d.js           Three.js landscape renderer for local tile maps
     ui.js                  tile/cell info panels + stats bar
     main.js                bootstrapping, view switching, pointer events
     rng.js                 seeded hash/PRNG (mulberry32), per-tile seeds
@@ -117,12 +117,20 @@ shading with a camera-attached light. Rivers are thin ribbon quads from tile
 center to edge midpoint — both tiles draw their half, so rivers connect
 seamlessly. Picking is a raycast with a `faceIndex → tile` lookup table.
 
-### Local tile maps (`localmap.js`, `mapview.js`)
+### Local tile maps (`localmap.js`, `terrain3d.js`)
 
 Double-click a tile on the globe (or hit **Explore this tile** in its panel) to
-open it as a ~2,500-cell isometric hex map. Generation is deterministic from
-`tileSeed` + world seed, and cached in memory, so revisiting a tile always
-shows the same map. How it stays consistent with the globe and with neighbors:
+open it as a full 3D landscape: smooth low-poly terrain with real water,
+carved meandering rivers, dense instanced forests, rock piles, ore crystal
+deposits, crop fields, coral reefs — and animals that wander around (deer,
+sheep, cattle, foxes; fish circle in the water). The landscape floats as a
+diorama with cliff edges at the tile boundary.
+
+`localmap.js` produces two layers: a continuous `sample(x, y)` terrain field
+(used by the renderer) and a hex-cell data grid sampled from the same field
+(gameplay data + click-for-info). Generation is deterministic from `tileSeed` +
+world seed, and cached in memory, so revisiting a tile always shows the same
+map. How it stays consistent with the globe and with neighbors:
 
 - Cell attributes are **IDW-interpolated from the tile + its globe neighbors**,
   then detailed with noise fields seeded by the *world* seed — those fields are

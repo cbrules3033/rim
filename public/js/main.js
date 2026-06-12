@@ -1,7 +1,7 @@
 import { generateWorld } from './worldgen.js';
 import { generateLocalMap } from './localmap.js';
 import { Globe } from './globe.js';
-import { MapView } from './mapview.js';
+import { TerrainView } from './terrain3d.js';
 import { showTile, showCell, showStats } from './ui.js';
 import { randomSeed } from './rng.js';
 
@@ -16,7 +16,7 @@ const locEl = document.getElementById('loc');
 const hintEl = document.getElementById('hint');
 
 const globe = new Globe(canvas);
-const mapView = new MapView(mapCanvas, (cell) => showCell(cell));
+const mapView = new TerrainView(mapCanvas, (cell) => showCell(cell));
 
 let world = null;
 let mode = 'globe';
@@ -51,7 +51,7 @@ function enterTile(tile) {
   mode = 'map';
   document.body.classList.add('map-mode');
   locEl.textContent = `${BIOMES[tile.biome].name} · tile #${tile.id}`;
-  hintEl.textContent = 'drag to pan · scroll to zoom · click a cell · Esc to return';
+  hintEl.textContent = 'drag to orbit · right-drag to pan · scroll to zoom · click ground for info · Esc to return';
   showCell(null);
 }
 
@@ -73,6 +73,19 @@ document.getElementById('gen').onclick = () => generate(seedInput.value.trim() |
 document.getElementById('rand').onclick = () => generate(randomSeed());
 seedInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') generate(seedInput.value.trim() || randomSeed());
+});
+
+// ---- local map picking (OrbitControls handles camera) ----
+let mDownX = 0, mDownY = 0;
+mapCanvas.addEventListener('pointerdown', (e) => {
+  mDownX = e.clientX;
+  mDownY = e.clientY;
+});
+mapCanvas.addEventListener('pointerup', (e) => {
+  if (Math.hypot(e.clientX - mDownX, e.clientY - mDownY) > 5) return; // drag
+  const cell = mapView.pick(e.clientX, e.clientY);
+  mapView.setSelected(cell);
+  showCell(cell);
 });
 
 // ---- globe picking (OrbitControls handles rotate/zoom) ----
@@ -100,18 +113,13 @@ canvas.addEventListener('pointermove', (e) => {
 const panel = document.getElementById('panel');
 panel.addEventListener('deselect', () => {
   if (mode === 'globe') globe.setSelected(null);
-  else {
-    mapView.selected = null;
-    mapView.dirty = true;
-  }
+  else mapView.setSelected(null);
 });
 panel.addEventListener('explore', (e) => enterTile(world.tiles[e.detail]));
 
-window.addEventListener('resize', () => { mapView.dirty = true; });
-
 function frame() {
   if (mode === 'globe') globe.render();
-  else if (mapView.dirty) mapView.draw();
+  else mapView.render();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -122,6 +130,8 @@ window.RIM = {
   get mode() { return mode; },
   enterTile: (id) => enterTile(world.tiles[id]),
   exitMap,
+  globe,
+  mapView,
 };
 
 const urlSeed = new URLSearchParams(location.search).get('seed');
