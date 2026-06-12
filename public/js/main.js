@@ -2,10 +2,10 @@ import { generateWorld } from './worldgen.js';
 import { generateLocalMap } from './localmap.js';
 import { Globe } from './globe.js';
 import { TerrainView } from './terrain3d.js';
-import { showTile, showCell, showStats } from './ui.js';
+import { showTile, showCell, showSettlement, showStats } from './ui.js';
 import { randomSeed } from './rng.js';
 
-import { BIOMES } from './defs.js';
+import { BIOMES, RESOURCES } from './defs.js';
 
 const canvas = document.getElementById('map');
 const mapCanvas = document.getElementById('localmap');
@@ -51,12 +51,15 @@ function enterTile(tile) {
   mode = 'map';
   document.body.classList.add('map-mode');
   locEl.textContent = `${BIOMES[tile.biome].name} · tile #${tile.id}`;
-  hintEl.textContent = 'drag to orbit · right-drag to pan · scroll to zoom · click ground for info · Esc to return';
+  hintEl.textContent = 'drag to orbit · right-drag to pan · ⛺ to settle · click a villager, then ground, to send them';
   showCell(null);
 }
 
 function exitMap() {
   mode = 'globe';
+  mapView.togglePlacement(false);
+  mapView.deselectCiv();
+  document.getElementById('tooltip').classList.add('hidden');
   document.body.classList.remove('map-mode');
   locEl.textContent = '';
   hintEl.textContent = 'drag to spin · scroll to zoom · click a tile · double-click to explore';
@@ -65,7 +68,10 @@ function exitMap() {
 
 backBtn.onclick = exitMap;
 window.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && mode === 'map') exitMap();
+  if (e.key !== 'Escape' || mode !== 'map') return;
+  if (mapView.placementMode) mapView.togglePlacement(false);
+  else if (mapView.selectedCiv) mapView.deselectCiv();
+  else exitMap();
 });
 
 // ---- seed controls ----
@@ -75,18 +81,39 @@ seedInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') generate(seedInput.value.trim() || randomSeed());
 });
 
-// ---- local map picking (OrbitControls handles camera) ----
-let mDownX = 0, mDownY = 0;
-mapCanvas.addEventListener('pointerdown', (e) => {
-  mDownX = e.clientX;
-  mDownY = e.clientY;
+// ---- local map interactions (TerrainView handles its own clicks) ----
+mapView.onInfo = (cell) => showCell(cell);
+mapView.onSettlement = (s) => {
+  const pop = mapView.map.civs.filter((c) => c.home === s.name).length;
+  showSettlement(s, pop);
+};
+const settleBtn = document.getElementById('settle');
+mapView.onPlacement = (active) => settleBtn.classList.toggle('active', active);
+settleBtn.onclick = () => mapView.togglePlacement();
+
+// terrain hover tooltip (mouse only)
+const tooltip = document.getElementById('tooltip');
+let tipTimer = 0;
+mapCanvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType !== 'mouse' || e.buttons || mapView.placementMode) {
+    tooltip.classList.add('hidden');
+    return;
+  }
+  const now = performance.now();
+  if (now - tipTimer < 60) return;
+  tipTimer = now;
+  const cell = mapView.probe(e.clientX, e.clientY);
+  if (!cell) {
+    tooltip.classList.add('hidden');
+    return;
+  }
+  const res = cell.resource ? ` · ${RESOURCES[cell.resource].i} ${RESOURCES[cell.resource].n}` : '';
+  tooltip.innerHTML = `<b>${BIOMES[cell.biome].name}</b><span class="dim">${cell.elevM} m · fert ${cell.fertility}${res}</span>`;
+  tooltip.style.left = e.clientX + 16 + 'px';
+  tooltip.style.top = e.clientY + 18 + 'px';
+  tooltip.classList.remove('hidden');
 });
-mapCanvas.addEventListener('pointerup', (e) => {
-  if (Math.hypot(e.clientX - mDownX, e.clientY - mDownY) > 5) return; // drag
-  const cell = mapView.pick(e.clientX, e.clientY);
-  mapView.setSelected(cell);
-  showCell(cell);
-});
+mapCanvas.addEventListener('pointerleave', () => tooltip.classList.add('hidden'));
 
 // ---- globe picking (OrbitControls handles rotate/zoom) ----
 let downX = 0, downY = 0;

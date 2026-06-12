@@ -109,6 +109,27 @@ export function showCell(c) {
   };
 }
 
+// Info panel for a settlement.
+export function showSettlement(s, civCount) {
+  const panel = document.getElementById('panel');
+  panel.classList.remove('hidden');
+  panel.innerHTML = `
+    <div class="panel-head">
+      <span class="swatch" style="background:#c9a876"></span>
+      <h2>${s.name}</h2>
+      <button id="panel-close" title="Close">✕</button>
+    </div>
+    <div class="kv"><span>Type</span><span>Settlement</span></div>
+    <div class="kv"><span>Population</span><span>${civCount}</span></div>
+    <div class="section">Orders</div>
+    <div class="dim">Click a villager to select them, then click anywhere walkable to send them there.</div>
+  `;
+  document.getElementById('panel-close').onclick = () => {
+    panel.classList.add('hidden');
+    panel.dispatchEvent(new CustomEvent('deselect', { bubbles: true }));
+  };
+}
+
 export function showStats(stats) {
   const el = document.getElementById('stats');
   const land = 100 - stats.waterPct;

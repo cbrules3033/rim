@@ -96,6 +96,47 @@ export class TerrainView {
     this.ring.rotation.x = Math.PI / 2;
     this.ring.visible = false;
     this.scene.add(this.ring);
+
+    // ---- settlement / villager state ----
+    this.placementMode = false;
+    this.selectedCiv = null;
+    this.civMeshes = [];
+    this.settlementMeshes = [];
+    this.onInfo = null;        // (cell) => — clicked plain ground
+    this.onSettlement = null;  // (settlement) => — clicked a settlement
+    this.onPlacement = null;   // (active) => — placement mode toggled
+
+    this.ghost = this.makeGhost();
+    this.scene.add(this.ghost);
+
+    this.civRing = new THREE.Mesh(
+      new THREE.TorusGeometry(2.4, 0.35, 8, 24),
+      new THREE.MeshBasicMaterial({ color: 0xffd84a }),
+    );
+    this.civRing.rotation.x = Math.PI / 2;
+    this.civRing.visible = false;
+    this.scene.add(this.civRing);
+
+    this.moveMarker = new THREE.Mesh(
+      new THREE.TorusGeometry(2.2, 0.3, 8, 24),
+      new THREE.MeshBasicMaterial({ color: 0x5aff7a, transparent: true, opacity: 0.9 }),
+    );
+    this.moveMarker.rotation.x = Math.PI / 2;
+    this.moveMarker.visible = false;
+    this.scene.add(this.moveMarker);
+
+    this.bindInput();
+  }
+
+  makeGhost() {
+    this.ghostMat = new THREE.MeshBasicMaterial({ color: 0x5aff7a, transparent: true, opacity: 0.45 });
+    const g = new THREE.Group();
+    const pad = new THREE.Mesh(new THREE.CylinderGeometry(16, 17, 1.2, 8), this.ghostMat);
+    const hall = new THREE.Mesh(new THREE.BoxGeometry(9, 6, 7), this.ghostMat);
+    hall.position.y = 3.5;
+    g.add(pad, hall);
+    g.visible = false;
+    return g;
   }
 
   // ---------- terrain field helpers ----------
@@ -153,6 +194,15 @@ export class TerrainView {
     this.map = map;
     this.movers = [];
     this.ring.visible = false;
+    this.civRing.visible = false;
+    this.moveMarker.visible = false;
+    this.ghost.visible = false;
+    this.placementMode = false;
+    this.selectedCiv = null;
+    this.civMeshes = [];
+    this.settlementMeshes = [];
+    map.settlements = map.settlements || []; // persists per tile (cached map)
+    map.civs = map.civs || [];
     this.group = new THREE.Group();
 
     this.riverW = 3 + Math.min(map.tile.flow, 10) * 0.35;
@@ -167,6 +217,8 @@ export class TerrainView {
     this.buildWater();
     this.buildRivers();
     this.buildProps();
+    for (const s of this.map.settlements) this.addSettlementMeshes(s);
+    for (const c of this.map.civs) this.addCivMesh(c);
     this.scene.add(this.group);
 
     this.camera.position.set(0, 380, 500);
@@ -588,6 +640,268 @@ export class TerrainView {
     }
   }
 
+  // ---------- settlements & villagers ----------
+
+  bindInput() {
+    let downX = 0, downY = 0;
+    this.canvas.addEventListener('pointerdown', (e) => {
+      downX = e.clientX;
+      downY = e.clientY;
+    });
+    this.canvas.addEventListener('pointerup', (e) => {
+      if (Math.hypot(e.clientX - downX, e.clientY - downY) > 5) return; // drag
+      this.handleClick(e.clientX, e.clientY);
+    });
+    this.canvas.addEventListener('pointermove', (e) => {
+      if (!this.placementMode || !this.map) return;
+      const hit = this.groundPoint(e.clientX, e.clientY);
+      if (!hit) {
+        this.ghost.visible = false;
+        return;
+      }
+      const ok = this.validSite(hit.x, hit.z);
+      this.ghost.position.set(hit.x, this.meshHeightAt(hit.x, hit.z), hit.z);
+      this.ghostMat.color.setHex(ok ? 0x5aff7a : 0xff5a5a);
+      this.ghost.visible = true;
+    });
+  }
+
+  setRay(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect();
+    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+  }
+
+  groundPoint(clientX, clientY) {
+    if (!this.terrain) return null;
+    this.setRay(clientX, clientY);
+    const hits = this.raycaster.intersectObject(this.terrain, false);
+    return hits.length ? hits[0].point : null;
+  }
+
+  validSite(x, z) {
+    if (this.distOutside(x, z) > 0) return false;
+    const h = this.meshHeightAt(x, z);
+    if (h < 0.8) return false;
+    for (const d of [[14, 0], [-14, 0], [0, 14], [0, -14]]) {
+      const hh = this.meshHeightAt(x + d[0], z + d[1]);
+      if (hh < 0.8 || Math.abs(hh - h) > 6) return false; // water or too steep
+    }
+    for (const s of this.map.settlements) {
+      if (Math.hypot(s.x - x, s.z - z) < 55) return false;
+    }
+    return true;
+  }
+
+  togglePlacement(on = !this.placementMode) {
+    this.placementMode = on;
+    if (!on) this.ghost.visible = false;
+    if (on) {
+      this.selectedCiv = null;
+      this.civRing.visible = false;
+    }
+    this.onPlacement?.(on);
+  }
+
+  handleClick(clientX, clientY) {
+    if (!this.map) return;
+    if (this.placementMode) {
+      const hit = this.groundPoint(clientX, clientY);
+      if (hit && this.validSite(hit.x, hit.z)) {
+        this.foundSettlement(hit.x, hit.z);
+        this.togglePlacement(false);
+      }
+      return;
+    }
+    this.setRay(clientX, clientY);
+    // villagers first, then settlements, then ground
+    let hits = this.raycaster.intersectObjects(this.civMeshes, true);
+    if (hits.length) {
+      let o = hits[0].object;
+      while (o && !o.userData.civ) o = o.parent;
+      if (o) {
+        this.selectedCiv = o.userData.civ;
+        this.civRing.visible = true;
+        this.ring.visible = false;
+        return;
+      }
+    }
+    hits = this.raycaster.intersectObjects(this.settlementMeshes, true);
+    if (hits.length) {
+      let o = hits[0].object;
+      while (o && !o.userData.settlement) o = o.parent;
+      if (o) {
+        this.onSettlement?.(o.userData.settlement);
+        return;
+      }
+    }
+    const hit = this.groundPoint(clientX, clientY);
+    if (!hit) return;
+    if (this.selectedCiv) {
+      // move order — only onto walkable ground
+      if (this.meshHeightAt(hit.x, hit.z) > 0.6 && this.distOutside(hit.x, hit.z) === 0) {
+        this.selectedCiv.target = [hit.x, hit.z];
+        this.moveMarker.position.set(hit.x, this.meshHeightAt(hit.x, hit.z) + 0.4, hit.z);
+        this.moveMarker.visible = true;
+      }
+      return;
+    }
+    const r = Math.round(hit.z / ROWH);
+    const q = Math.round(hit.x / HEXW - r / 2);
+    const cell = this.map.byKey.get(q + ',' + r) || null;
+    if (cell) {
+      this.setSelected(cell);
+      this.onInfo?.(cell);
+    }
+  }
+
+  deselectCiv() {
+    this.selectedCiv = null;
+    this.civRing.visible = false;
+    this.moveMarker.visible = false;
+  }
+
+  foundSettlement(x, z) {
+    const rng = mulberry32((Math.round(x) * 31 + Math.round(z) * 7) ^ this.map.tile.seed);
+    const SYL = ['ka', 'zor', 'rim', 'tha', 'vel', 'un', 'dra', 'mo', 'qui', 'lex',
+      'ar', 'ten', 'bel', 'os', 'nia', 'gul', 'fer', 'wyn', 'ash', 'tor'];
+    let name = '';
+    const sylCount = 2 + Math.floor(rng() * 2);
+    for (let i = 0; i < sylCount; i++) name += SYL[Math.floor(rng() * SYL.length)];
+    name = name[0].toUpperCase() + name.slice(1);
+
+    const s = { x, z, name, founded: Date.now() };
+    this.map.settlements.push(s);
+    this.addSettlementMeshes(s);
+
+    const CLOTHES = [0x4a7ab5, 0xb55a4a, 0x5ab55a, 0xb5a04a, 0x8a5ab5, 0x4ab5a8];
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2 + rng();
+      const civ = {
+        x: x + Math.cos(a) * 22, z: z + Math.sin(a) * 22,
+        color: CLOTHES[Math.floor(rng() * CLOTHES.length)],
+        home: name, target: null, speed: 9, phase: rng() * 6.28,
+      };
+      this.map.civs.push(civ);
+      this.addCivMesh(civ);
+    }
+    this.onSettlement?.(s);
+  }
+
+  addSettlementMeshes(s) {
+    const rng = mulberry32((Math.round(s.x) * 31 + Math.round(s.z) * 7) ^ this.map.tile.seed);
+    const g = new THREE.Group();
+    const h = this.meshHeightAt(s.x, s.z);
+    const wall = new THREE.MeshLambertMaterial({ color: 0xc9a876 });
+    const wallHall = new THREE.MeshLambertMaterial({ color: 0xb5906a });
+    const roofM = new THREE.MeshLambertMaterial({ color: 0x8a4a3a });
+    const padM = new THREE.MeshLambertMaterial({ color: 0x8a7a62 });
+
+    const pad = new THREE.Mesh(new THREE.CylinderGeometry(16, 18, 2.4, 8), padM);
+    pad.position.set(0, 0, 0);
+    g.add(pad);
+
+    const house = (w, hh, d, mat) => {
+      const hg = new THREE.Group();
+      const body = new THREE.Mesh(new THREE.BoxGeometry(w, hh, d), mat);
+      body.position.y = hh / 2;
+      // triangular prism roof: 3-sided cylinder laid along X, apex up
+      const r = d * 0.72;
+      const roofGeo = new THREE.CylinderGeometry(r, r, w * 1.08, 3, 1);
+      roofGeo.rotateZ(Math.PI / 2);
+      roofGeo.scale(1, 0.62, 1);
+      const roof = new THREE.Mesh(roofGeo, roofM);
+      roof.position.y = hh + r * 0.31;
+      hg.add(body, roof);
+      hg.traverse((o) => { o.castShadow = true; });
+      return hg;
+    };
+
+    const hall = house(9, 6, 7, wallHall);
+    hall.position.set(0, 1.1, 0);
+    g.add(hall);
+    for (let i = 0; i < 4; i++) {
+      const a = rng() * Math.PI * 2;
+      const hut = house(4.5, 3.2, 4, wall);
+      hut.position.set(Math.cos(a) * 11.5, 1.1, Math.sin(a) * 11.5);
+      hut.rotation.y = rng() * Math.PI;
+      g.add(hut);
+    }
+    g.position.set(s.x, h - 0.8, s.z);
+    g.userData.settlement = s;
+    this.group.add(g);
+    this.settlementMeshes.push(g);
+  }
+
+  addCivMesh(civ) {
+    const g = new THREE.Group();
+    const body = new THREE.Mesh(
+      new THREE.CapsuleGeometry(0.75, 1.5, 3, 8),
+      new THREE.MeshLambertMaterial({ color: civ.color }),
+    );
+    body.position.y = 1.6;
+    const head = new THREE.Mesh(
+      new THREE.SphereGeometry(0.62, 10, 8),
+      new THREE.MeshLambertMaterial({ color: 0xd9a878 }),
+    );
+    head.position.y = 3.2;
+    g.add(body, head);
+    g.traverse((o) => { o.castShadow = true; });
+    g.position.set(civ.x, this.meshHeightAt(civ.x, civ.z), civ.z);
+    g.userData.civ = civ;
+    civ.mesh = g;
+    this.group.add(g);
+    this.civMeshes.push(g);
+  }
+
+  updateCivs(dt, t) {
+    for (const civ of this.map.civs) {
+      const g = civ.mesh;
+      if (!g) continue;
+      let bob = 0;
+      if (civ.target) {
+        const dx = civ.target[0] - civ.x, dz = civ.target[1] - civ.z;
+        const dist = Math.hypot(dx, dz);
+        if (dist < 1.2) {
+          civ.target = null;
+          if (this.selectedCiv === civ) this.moveMarker.visible = false;
+        } else {
+          const step = Math.min(dist, civ.speed * dt);
+          const nx = civ.x + (dx / dist) * step;
+          const nz = civ.z + (dz / dist) * step;
+          if (this.meshHeightAt(nx, nz) > 0.6) {
+            civ.x = nx;
+            civ.z = nz;
+            g.rotation.y = -Math.atan2(dz, dx) + Math.PI / 2;
+            bob = Math.abs(Math.sin(t * 11 + civ.phase)) * 0.5;
+          } else {
+            civ.target = null; // refuses to swim
+            if (this.selectedCiv === civ) this.moveMarker.visible = false;
+          }
+        }
+      }
+      g.position.set(civ.x, this.meshHeightAt(civ.x, civ.z) + bob, civ.z);
+    }
+    if (this.selectedCiv?.mesh) {
+      const m = this.selectedCiv.mesh;
+      this.civRing.position.set(m.position.x, m.position.y + 0.5, m.position.z);
+    }
+    if (this.moveMarker.visible) {
+      const p = 1 + Math.sin(t * 6) * 0.15;
+      this.moveMarker.scale.set(p, p, 1);
+    }
+  }
+
+  // hover probe for the terrain tooltip
+  probe(clientX, clientY) {
+    const hit = this.groundPoint(clientX, clientY);
+    if (!hit || this.distOutside(hit.x, hit.z) > 0) return null;
+    const r = Math.round(hit.z / ROWH);
+    const q = Math.round(hit.x / HEXW - r / 2);
+    return this.map.byKey.get(q + ',' + r) || null;
+  }
+
   // ---------- picking ----------
 
   pick(clientX, clientY) {
@@ -624,6 +938,7 @@ export class TerrainView {
     }
     const dt = Math.min(this.clock.getDelta(), 0.1);
     this.animate(dt);
+    if (this.map) this.updateCivs(dt, this.clock.elapsedTime);
     this.controls.update();
     this.renderer.render(this.scene, this.camera);
   }
